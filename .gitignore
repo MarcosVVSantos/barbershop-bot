@@ -1,0 +1,23 @@
+# Secrets
+.env
+credentials/
+
+# Dados locais
+data/*.db
+data/*.py
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Docker
+*.log
+
+# Misc
+.DS_Store
+qrcode.png

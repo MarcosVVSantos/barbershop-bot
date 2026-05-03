@@ -1,0 +1,74 @@
+version: "3.9"
+
+services:
+  mcp_server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mcp
+    container_name: barbershop_mcp
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data:/app/data
+      - ./credentials:/app/credentials:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - FASTMCP_PORT=8001
+      - FASTMCP_HOST=0.0.0.0
+      - GOOGLE_CALENDAR_ID=${GOOGLE_CALENDAR_ID}
+      - GOOGLE_CREDENTIALS_PATH=${GOOGLE_CREDENTIALS_PATH}
+    networks:
+      - barbershop_net
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    container_name: barbershop_gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - EVOLUTION_API_URL=http://evolution_api:8080
+      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
+      - EVOLUTION_INSTANCE=${EVOLUTION_INSTANCE:-barbershop}
+      - MCP_SERVER_URL=http://mcp_server:8001/mcp
+    depends_on:
+      - mcp_server
+    networks:
+      - barbershop_net
+
+  evolution_api:
+    image: atendai/evolution-api:v1.8.7
+    container_name: evolution_api
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    volumes:
+      - evolution_data:/evolution/instances
+    environment:
+      - SERVER_URL=http://localhost:8082
+      - AUTHENTICATION_TYPE=apikey
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      - AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
+      - WEBHOOK_GLOBAL_URL=http://gateway:8000/webhook
+      - WEBHOOK_GLOBAL_ENABLED=true
+      - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
+      - QRCODE_LIMIT=30
+      - LOG_LEVEL=ERROR
+      - STORE_MESSAGES=true
+      - STORE_MESSAGE_UP=true
+      - STORE_CONTACTS=true
+      - STORE_CHATS=true
+    networks:
+      - barbershop_net
+
+networks:
+  barbershop_net:
+    driver: bridge
+
+volumes:
+  evolution_data:

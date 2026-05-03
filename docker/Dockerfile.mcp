@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.mcp.txt .
+RUN pip install --no-cache-dir -r requirements.mcp.txt
+
+# Copia o server para mcp_server/server.py para que o DB_PATH
+# (parent.parent / "data") resolva para /app/data — onde o volume é montado
+RUN mkdir -p mcp_server
+COPY Server.py mcp_server/server.py
+
+EXPOSE 8001
+
+CMD ["python", "mcp_server/server.py"]
