@@ -18,21 +18,34 @@ from pydantic import BaseModel, Field, ConfigDict
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gcal_build
 
+# ─── Config do negócio ────────────────────────────────────────────────────────
+_CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/app/config.json"))
+
+def _load_config() -> dict:
+    if _CONFIG_PATH.exists():
+        try:
+            return json.loads(_CONFIG_PATH.read_text())
+        except Exception as e:
+            print(f"[WARN] Erro ao ler config.json: {e}")
+    return {}
+
+_cfg = _load_config()
+_atendimento = _cfg.get("atendimento", {})
+
 # ─── Constantes ───────────────────────────────────────────────────────────────
 DB_PATH = Path(__file__).parent.parent / "data" / "barbershop.db"
-HORARIO_ABERTURA = 9
-HORARIO_FECHAMENTO = 19
-DURACAO_CORTE_MIN = 30
+HORARIO_ABERTURA  = _atendimento.get("horario_abertura", 9)
+HORARIO_FECHAMENTO = _atendimento.get("horario_fechamento", 19)
+DURACAO_CORTE_MIN  = _atendimento.get("intervalo_minutos", 30)
 SP_TZ = ZoneInfo("America/Sao_Paulo")
 
 CALENDAR_ID       = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 CREDENTIALS_PATH  = Path(os.getenv("GOOGLE_CREDENTIALS_PATH", "/app/credentials/google-calendar.json"))
 
-DURACAO_SERVICO = {
-    "corte+barba": 60,
-    "progressiva": 60,
-    "corte": 30,
-    "barba": 30,
+DURACAO_SERVICO: dict = {
+    k.lower(): v for k, v in _cfg.get("servicos", {
+        "corte+barba": 60, "progressiva": 60, "corte": 30, "barba": 30,
+    }).items()
 }
 
 _calendar_svc = None
@@ -138,50 +151,56 @@ def init_db(conn: sqlite3.Connection):
         preco REAL,
         imagem_url TEXT DEFAULT ''
     );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id TEXT PRIMARY KEY,
+        entidade TEXT NOT NULL,     -- 'agendamento', 'cliente', etc.
+        entidade_id TEXT NOT NULL,
+        acao TEXT NOT NULL,         -- 'criado', 'cancelado', etc.
+        detalhes TEXT NOT NULL,     -- JSON com contexto do evento
+        criado_em TEXT NOT NULL
+    );
     """)
     conn.commit()
     _seed_produtos(conn)
     _seed_cortes(conn)
 
 def _seed_produtos(conn: sqlite3.Connection):
-    """Insere produtos de exemplo se o catálogo estiver vazio."""
+    """Insere produtos do config.json se o catálogo estiver vazio."""
     count = conn.execute("SELECT COUNT(*) FROM produtos").fetchone()[0]
     if count > 0:
         return
-    produtos = [
-        (str(uuid.uuid4()), "Pomada Matte Black", "Fixação forte, acabamento fosco. Ideal para cabelos médios e crespos.", 45.00, "pomada", 20, 1, ""),
-        (str(uuid.uuid4()), "Pomada Brilhosa Clássica", "Fixação média, brilho intenso. Estilo retrô e clássico.", 40.00, "pomada", 15, 1, ""),
-        (str(uuid.uuid4()), "Shampoo Antiqueda", "Com biotina e queratina. Fortalece os fios e reduz a queda.", 35.00, "shampoo", 25, 1, ""),
-        (str(uuid.uuid4()), "Balm para Barba", "Hidrata, amacia e perfuma a barba. Aroma amadeirado.", 55.00, "balm", 12, 1, ""),
-        (str(uuid.uuid4()), "Óleo de Barba Premium", "Óleo de argan + jojoba. Domina o frizz e dá brilho natural.", 65.00, "oleo", 10, 1, ""),
-        (str(uuid.uuid4()), "Condicionador Masculino", "Com manteiga de karité. Desembaraça e hidrata sem pesar.", 30.00, "condicionador", 20, 1, ""),
+    produtos_cfg = _cfg.get("produtos", [])
+    if not produtos_cfg:
+        return
+    rows = [
+        (str(uuid.uuid4()), p["nome"], p.get("descricao", ""), p.get("preco", 0.0),
+         p.get("categoria", "geral"), p.get("estoque", 10), 1, "")
+        for p in produtos_cfg
     ]
     conn.executemany(
         "INSERT INTO produtos (id, nome, descricao, preco, categoria, estoque, ativo, imagem_url) VALUES (?,?,?,?,?,?,?,?)",
-        produtos
+        rows
     )
     conn.commit()
 
 def _seed_cortes(conn: sqlite3.Connection):
-    """Insere catálogo de cortes para RAG."""
+    """Insere catálogo de serviços do config.json se estiver vazio."""
     count = conn.execute("SELECT COUNT(*) FROM catalogo_cortes").fetchone()[0]
     if count > 0:
         return
-    cortes = [
-        (str(uuid.uuid4()), "Degradê Americano", "Fade suave nas laterais com volume no topo. Moderno e versátil.", '["degradê","moderno","curto","social","esportivo"]', 30, 35.0),
-        (str(uuid.uuid4()), "Degradê com Risco", "Fade nas laterais com risco definido. Estilo e precisão.", '["degradê","risco","social","moderno"]', 35, 40.0),
-        (str(uuid.uuid4()), "Corte Clássico", "Lateral curta e topo com volume leve. Ideal para ambientes formais.", '["clássico","social","comprido","formal","tradicional"]', 30, 35.0),
-        (str(uuid.uuid4()), "Undercut", "Laterais completamente raspadas, topo longo. Estilo underground e moderno.", '["undercut","moderno","alternativo","comprido","estiloso"]', 40, 45.0),
-        (str(uuid.uuid4()), "Corte Cacheado", "Valoriza os cachos com forma e leveza. Sem perder o volume natural.", '["cacheado","crespo","volume","natural","leve"]', 30, 35.0),
-        (str(uuid.uuid4()), "Militar / Máquina", "Cabelo rente com máquina em número uniforme. Prático e limpo.", '["militar","máquina","curto","prático","clássico"]', 20, 25.0),
-        (str(uuid.uuid4()), "Long Top Fade", "Topo longo com fade nas laterais. Muito popular entre jovens.", '["moderno","longo","degradê","jovem","estiloso"]', 40, 50.0),
-        (str(uuid.uuid4()), "Corte + Barba", "Combinação de corte degradê com design e acabamento de barba.", '["corte","barba","combo","completo","cuidado"]', 60, 65.0),
-        (str(uuid.uuid4()), "Barba Desenhada", "Design preciso no contorno da barba. Linhas retas e definidas.", '["barba","design","contorno","preciso","cuidado"]', 30, 35.0),
-        (str(uuid.uuid4()), "Progressiva Masculina", "Alinhamento e redução do volume com escova + produto específico.", '["progressiva","liso","volume","comprido","tratamento"]', 90, 120.0),
+    catalogo_cfg = _cfg.get("catalogo", [])
+    if not catalogo_cfg:
+        return
+    rows = [
+        (str(uuid.uuid4()), c["nome"], c.get("descricao", ""),
+         json.dumps(c.get("tags", []), ensure_ascii=False),
+         c.get("tempo_execucao", 30), c.get("preco", 0.0))
+        for c in catalogo_cfg
     ]
     conn.executemany(
         "INSERT INTO catalogo_cortes (id, nome, descricao, tags, tempo_execucao, preco) VALUES (?,?,?,?,?,?)",
-        cortes
+        rows
     )
     conn.commit()
 
@@ -430,6 +449,12 @@ async def agendar_corte(params: AgendarCorteInput) -> str:
             "UPDATE clientes SET ultima_visita = ?, total_visitas = total_visitas + 1 WHERE id = ?",
             (data_hora, params.cliente_id)
         )
+        conn.execute(
+            "INSERT INTO audit_log (id, entidade, entidade_id, acao, detalhes, criado_em) VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "agendamento", event_id, "criado",
+             json.dumps({"cliente_id": params.cliente_id, "cliente": cliente["nome"], "data_hora": data_hora, "servico": params.servico}, ensure_ascii=False),
+             agora)
+        )
         conn.commit()
 
         return json.dumps({
@@ -470,10 +495,23 @@ async def cancelar_agendamento(params: CancelarAgendamentoInput) -> str:
         if row["status"] == "cancelado":
             return json.dumps({"sucesso": False, "erro": "Agendamento já estava cancelado."}, ensure_ascii=False)
 
+        try:
+            svc = get_calendar_service()
+            svc.events().delete(calendarId=CALENDAR_ID, eventId=params.agendamento_id).execute()
+        except Exception:
+            pass
+
         obs_nova = f"{row['observacoes']} | Cancelado: {params.motivo or 'sem motivo'}".strip(" |")
+        agora = datetime.now().isoformat()
         conn.execute(
             "UPDATE agendamentos SET status = 'cancelado', observacoes = ? WHERE id = ?",
             (obs_nova, params.agendamento_id)
+        )
+        conn.execute(
+            "INSERT INTO audit_log (id, entidade, entidade_id, acao, detalhes, criado_em) VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "agendamento", params.agendamento_id, "cancelado",
+             json.dumps({"motivo": params.motivo or "sem motivo", "data_hora": row["data_hora"], "servico": row["servico"]}, ensure_ascii=False),
+             agora)
         )
         conn.commit()
         return json.dumps({"sucesso": True, "mensagem": f"Agendamento de {row['data_hora']} cancelado com sucesso."}, ensure_ascii=False)

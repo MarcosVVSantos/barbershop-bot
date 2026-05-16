@@ -1,0 +1,35 @@
+{
+  "negocio": {
+    "nome": "Nutri Vida",
+    "tipo": "nutricionista",
+    "descricao": "Consultório de nutrição clínica e esportiva"
+  },
+  "assistente": {
+    "tom": "acolhedor, profissional e focado em saúde e bem-estar. Evite termos técnicos demais, fale de forma que qualquer pessoa entenda",
+    "regras_extras": [
+      "Lembre o cliente de trazer exames recentes para a consulta",
+      "Pergunte se é consulta presencial ou online ao agendar",
+      "Nunca dê orientações nutricionais pelo chat — oriente a agendar uma consulta"
+    ]
+  },
+  "atendimento": {
+    "horario_abertura": 8,
+    "horario_fechamento": 18,
+    "intervalo_minutos": 60
+  },
+  "servicos": {
+    "consulta inicial": 60,
+    "retorno": 30,
+    "avaliacao corporal": 45,
+    "plano alimentar": 60,
+    "consulta online": 45
+  },
+  "produtos": [
+    {"nome": "Whey Protein Isolado", "descricao": "Proteína de alto valor biológico. Baunilha ou chocolate.", "preco": 120.0, "categoria": "suplemento", "estoque": 15},
+    {"nome": "Creatina Monohidratada", "descricao": "Melhora performance e força muscular.", "preco": 80.0, "categoria": "suplemento", "estoque": 20},
+    {"nome": "Ômega 3", "descricao": "Ácidos graxos essenciais para saúde cardiovascular.", "preco": 55.0, "categoria": "suplemento", "estoque": 30},
+    {"nome": "Vitamina D3 + K2", "descricao": "Suporte imunológico e absorção de cálcio.", "preco": 45.0, "categoria": "vitamina", "estoque": 25},
+    {"nome": "Colágeno Hidrolisado", "descricao": "Para articulações, pele e cabelo.", "preco": 65.0, "categoria": "suplemento", "estoque": 18}
+  ],
+  "catalogo": []
+}

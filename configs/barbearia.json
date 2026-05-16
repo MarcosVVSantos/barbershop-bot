@@ -1,0 +1,42 @@
+{
+  "negocio": {
+    "nome": "Barbearia do Marcos",
+    "tipo": "barbearia",
+    "descricao": "Barbearia masculina moderna no centro da cidade"
+  },
+  "assistente": {
+    "tom": "descontraído e simpático, como um barbeiro experiente que conhece todos os clientes pelo nome",
+    "regras_extras": [
+      "Ao sugerir horários, prefira os da manhã se o cliente não tiver preferência",
+      "Após o agendamento, lembre o cliente de chegar 5 minutos antes"
+    ]
+  },
+  "atendimento": {
+    "horario_abertura": 9,
+    "horario_fechamento": 19,
+    "intervalo_minutos": 30
+  },
+  "servicos": {
+    "corte": 30,
+    "barba": 30,
+    "corte+barba": 60,
+    "progressiva": 60,
+    "hidratacao": 45
+  },
+  "produtos": [
+    {"nome": "Pomada Matte Black", "descricao": "Fixação forte, acabamento fosco. Ideal para cabelos médios e crespos.", "preco": 45.0, "categoria": "pomada", "estoque": 20},
+    {"nome": "Pomada Brilhosa Clássica", "descricao": "Fixação média, brilho intenso. Estilo retrô e clássico.", "preco": 40.0, "categoria": "pomada", "estoque": 15},
+    {"nome": "Shampoo Antiqueda", "descricao": "Com biotina e queratina. Fortalece os fios e reduz a queda.", "preco": 35.0, "categoria": "shampoo", "estoque": 25},
+    {"nome": "Balm para Barba", "descricao": "Hidrata, amacia e perfuma a barba. Aroma amadeirado.", "preco": 55.0, "categoria": "balm", "estoque": 12},
+    {"nome": "Óleo de Barba Premium", "descricao": "Óleo de argan + jojoba. Domina o frizz e dá brilho natural.", "preco": 65.0, "categoria": "oleo", "estoque": 10},
+    {"nome": "Condicionador Masculino", "descricao": "Com manteiga de karité. Desembaraça e hidrata sem pesar.", "preco": 30.0, "categoria": "condicionador", "estoque": 20}
+  ],
+  "catalogo": [
+    {"nome": "Degradê Americano", "descricao": "Fade suave nas laterais com volume no topo. Moderno e versátil.", "tags": ["degradê","moderno","curto","social","esportivo"], "tempo_execucao": 30, "preco": 35.0},
+    {"nome": "Degradê com Risco", "descricao": "Fade nas laterais com risco definido. Estilo e precisão.", "tags": ["degradê","risco","social","moderno"], "tempo_execucao": 35, "preco": 40.0},
+    {"nome": "Corte Clássico", "descricao": "Lateral curta e topo com volume leve. Ideal para ambientes formais.", "tags": ["clássico","social","formal","tradicional"], "tempo_execucao": 30, "preco": 35.0},
+    {"nome": "Undercut", "descricao": "Laterais completamente raspadas, topo longo. Estilo underground e moderno.", "tags": ["undercut","moderno","alternativo","comprido"], "tempo_execucao": 40, "preco": 45.0},
+    {"nome": "Corte Cacheado", "descricao": "Valoriza os cachos com forma e leveza. Sem perder o volume natural.", "tags": ["cacheado","crespo","volume","natural"], "tempo_execucao": 30, "preco": 35.0},
+    {"nome": "Militar / Máquina", "descricao": "Cabelo rente com máquina em número uniforme. Prático e limpo.", "tags": ["militar","máquina","curto","prático"], "tempo_execucao": 20, "preco": 25.0}
+  ]
+}

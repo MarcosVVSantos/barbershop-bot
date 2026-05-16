@@ -1,4 +1,5 @@
 import os, json, time, httpx
+from pathlib import Path
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -15,23 +16,99 @@ MCP_SERVER_URL     = os.getenv("MCP_SERVER_URL", "http://localhost:8001/mcp")
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 MODEL = "llama-3.3-70b-versatile"
 
-LID_MAP = {
-    "12481846079597": "5511977957833",
-}
+LID_MAP_FILE = Path("/app/data/lid_map.json")
+
+def _load_lid_map() -> dict:
+    if LID_MAP_FILE.exists():
+        try:
+            return json.loads(LID_MAP_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def _save_lid_map(lid_map: dict):
+    try:
+        LID_MAP_FILE.write_text(json.dumps(lid_map, indent=2, ensure_ascii=False))
+    except Exception as e:
+        print(f"[WARN] Não foi possível salvar lid_map: {e}", flush=True)
+
+async def _resolver_lid_via_api(lid: str) -> str | None:
+    """Consulta a Evolution API para obter o telefone real de um LID desconhecido."""
+    try:
+        url = f"{EVOLUTION_API_URL}/contact/findContacts/{EVOLUTION_INSTANCE}"
+        headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=3.0) as http:
+            r = await http.post(url, headers=headers, json={"where": {"remoteJid": f"{lid}@lid"}})
+            if r.status_code == 200:
+                contacts = r.json()
+                if isinstance(contacts, list):
+                    for c in contacts:
+                        jid = c.get("remoteJid") or c.get("id", "")
+                        if jid.endswith("@s.whatsapp.net"):
+                            return jid.replace("@s.whatsapp.net", "")
+    except Exception as e:
+        print(f"[WARN] Resolução de LID via API falhou: {e}", flush=True)
+    return None
+
+LID_MAP: dict = _load_lid_map()
 
 # Dedup: armazena msg_id -> timestamp para evitar processar a mesma mensagem duas vezes
 _processed: dict[str, float] = {}
 
-SYSTEM_PROMPT = """Voce eh o assistente virtual da barbearia, simpatico e descontraido em portugues brasileiro.
+# ── Config do negócio ─────────────────────────────────────────────────────────
+CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/app/config.json"))
+
+def _load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except Exception as e:
+            print(f"[WARN] Erro ao ler config.json: {e}", flush=True)
+    return {}
+
+def _build_system_prompt(cfg: dict) -> str:
+    negocio    = cfg.get("negocio", {})
+    assistente = cfg.get("assistente", {})
+    servicos   = cfg.get("servicos", {})
+
+    nome      = negocio.get("nome", "nosso estabelecimento")
+    descricao = negocio.get("descricao", "")
+    tom       = assistente.get("tom", "simpático e profissional")
+    extras    = assistente.get("regras_extras", [])
+
+    servicos_str = ", ".join(
+        f"{s} ({d} min)" for s, d in servicos.items()
+    ) if servicos else "consulte a equipe para saber os serviços disponíveis"
+
+    regras_extras_str = ""
+    if extras:
+        regras_extras_str = "\n" + "\n".join(
+            f"{10 + i}. {r}" for i, r in enumerate(extras)
+        )
+
+    return f"""Voce eh o assistente virtual d{_artigo(negocio.get('tipo',''))} {nome}, {tom}, em portugues brasileiro.
+{f'Sobre nos: {descricao}' if descricao else ''}
+Servicos oferecidos: {servicos_str}
+A data de hoje e: {{hoje}}.
+
 REGRAS:
-1. Sempre use identificar_cliente no inicio com o telefone do cliente
-2. Se cliente novo, peca o nome
-3. Salve preferencias mencionadas
-4. Ao confirmar agendamento, ofereca produtos
-5. Confirme sempre data, hora e servico antes de agendar
-6. Se horario ocupado, sugira proximos disponiveis
-7. Use emojis moderadamente: corte barba agenda produtos
+1. Sempre use identificar_cliente no inicio com o telefone do cliente (somente telefone, sem nome)
+2. Se cliente novo (status='novo'), PERGUNTE o nome ao usuario ANTES de chamar identificar_cliente novamente. NUNCA use nomes genericos como 'Nome do cliente' ou 'Cliente' como nome real
+3. DATAS: Se o cliente informar apenas o dia (ex: 'dia 22'), assuma o mes e ano atuais. Se informar dia e mes sem ano, assuma o ano atual. Sempre converta para YYYY-MM-DD antes de usar nas ferramentas
+4. VALIDACAO DE HORARIO: Sempre chame listar_horarios_disponiveis antes de agendar. Se o horario pedido nao estiver na lista, informe o cliente e sugira os proximos horarios livres. Somente chame agendar_corte se o horario estiver disponivel
+5. Apos agendar_corte retornar sucesso, o agendamento esta CONCLUIDO. NAO chame agendar_corte de novo na mesma conversa
+6. CANCELAMENTO: Use historico_cliente para buscar agendamentos, apresente os futuros e pergunte qual cancelar. Apos confirmar, chame cancelar_agendamento
+7. Salve preferencias mencionadas pelo cliente
+8. Apos confirmar agendamento, ofereca produtos se houver. Se cliente recusar, despeça-se gentilmente
+9. Use emojis moderadamente{regras_extras_str}
 """
+
+def _artigo(tipo: str) -> str:
+    femininos = {"nutricionista", "adega", "loja", "clinica", "farmacia", "academia"}
+    return "a" if tipo.lower() in femininos else "o"
+
+_cfg = _load_config()
+SYSTEM_PROMPT = _build_system_prompt(_cfg)
 
 TOOLS = [
     {"name":"identificar_cliente","description":"Identifica ou cadastra cliente pelo WhatsApp. SEMPRE chame no inicio.","parameters":{"type":"object","properties":{"telefone":{"type":"string"},"nome":{"type":"string"}},"required":["telefone"]}},
@@ -111,11 +188,11 @@ async def call_mcp_tool(tool_name: str, arguments: dict) -> str:
         print(f"[ERRO] call_mcp_tool {tool_name}: {e}", flush=True)
         return json.dumps({"erro": str(e)})
 
-async def send_whatsapp_message(telefone: str, texto: str):
+async def send_whatsapp_message(numero: str, texto: str):
     url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE}"
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
-    payload = {"number": telefone, "textMessage": {"text": texto}, "delay": 1200}
-    print(f"[DEBUG] Enviando WhatsApp para {telefone} url={url}", flush=True)
+    payload = {"number": numero, "textMessage": {"text": texto}, "delay": 1200}
+    print(f"[DEBUG] Enviando WhatsApp para {numero} url={url}", flush=True)
     async with httpx.AsyncClient(timeout=15.0) as http:
         try:
             r = await http.post(url, json=payload, headers=headers)
@@ -123,32 +200,42 @@ async def send_whatsapp_message(telefone: str, texto: str):
         except Exception as e:
             print(f"[ERRO] WhatsApp: {e}", flush=True)
 
-async def processar_mensagem(telefone: str, texto: str):
+async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
     print(f"[DEBUG] Iniciando processamento para {telefone}: {texto}", flush=True)
     try:
         historico_raw = await call_mcp_tool("buscar_sessao", {"telefone": telefone, "limite": 20})
         historico = json.loads(historico_raw).get("historico", [])
         await call_mcp_tool("salvar_mensagem_sessao", {"telefone": telefone, "mensagem": texto, "papel": "user"})
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        from datetime import date
+        prompt = SYSTEM_PROMPT.format(hoje=date.today().strftime("%d/%m/%Y"))
+        messages = [{"role": "system", "content": prompt}]
         for h in historico:
             role = "user" if h["papel"] == "user" else "assistant"
             messages.append({"role": role, "content": h["mensagem"]})
 
-        primeira = f"ATENÇÃO: O telefone do cliente é {telefone}. Use EXATAMENTE esse número ao chamar identificar_cliente. Mensagem do cliente: {texto}" if not historico else texto
-        messages.append({"role": "user", "content": primeira})
+        msg_com_telefone = f"[telefone do cliente: {telefone}] {texto}"
+        messages.append({"role": "user", "content": msg_com_telefone})
 
         resposta_final = ""
 
         for i in range(10):
             print(f"[DEBUG] Chamando Groq iter={i}", flush=True)
-            response = await groq_client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                tools=GROQ_TOOLS,
-                tool_choice="auto",
-                parallel_tool_calls=False
-            )
+            for tentativa in range(3):
+                try:
+                    response = await groq_client.chat.completions.create(
+                        model=MODEL,
+                        messages=messages,
+                        tools=GROQ_TOOLS,
+                        tool_choice="auto",
+                        parallel_tool_calls=False
+                    )
+                    break
+                except Exception as e:
+                    if "tool_use_failed" in str(e) and tentativa < 2:
+                        print(f"[WARN] Groq tool_use_failed, tentativa {tentativa+1}/3", flush=True)
+                        continue
+                    raise
             print(f"[DEBUG] Groq respondeu iter={i}", flush=True)
 
             msg = response.choices[0].message
@@ -180,17 +267,19 @@ async def processar_mensagem(telefone: str, texto: str):
         if not resposta_final:
             resposta_final = "Desculpa, tive um problema. Pode repetir?"
 
+        destino = send_to or telefone
         await call_mcp_tool("salvar_mensagem_sessao", {"telefone": telefone, "mensagem": resposta_final, "papel": "assistant"})
-        await send_whatsapp_message(telefone, resposta_final)
-        print(f"[OK] Resposta enviada para {telefone}: {resposta_final[:80]}", flush=True)
+        await send_whatsapp_message(destino, resposta_final)
+        print(f"[OK] Resposta enviada para {destino}: {resposta_final[:80]}", flush=True)
 
     except Exception as e:
         msg_erro = str(e)
         print(f"[ERRO] processar_mensagem: {msg_erro}", flush=True)
+        destino = send_to or telefone
         if "429" in msg_erro or "rate_limit" in msg_erro:
-            await send_whatsapp_message(telefone, "Estou sobrecarregado agora, tenta em alguns minutinhos! ⏳")
+            await send_whatsapp_message(destino, "Estou sobrecarregado agora, tenta em alguns minutinhos! ⏳")
         else:
-            await send_whatsapp_message(telefone, "Desculpa, tive um problema tecnico. Tenta de novo!")
+            await send_whatsapp_message(destino, "Desculpa, tive um problema tecnico. Tenta de novo!")
 
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
@@ -207,13 +296,28 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     if key.get("fromMe", False):
         return JSONResponse({"ok": True})
     remote_jid = key.get("remoteJid", "")
+    send_to = None
     if remote_jid.endswith("@lid"):
         lid = remote_jid.replace("@lid", "")
-        if lid not in LID_MAP:
-            return JSONResponse({"ok": True})
-        telefone = LID_MAP[lid]
+        if lid in LID_MAP:
+            telefone = LID_MAP[lid]
+            send_to = telefone
+        else:
+            # LID desconhecido: tenta resolver via Evolution API
+            telefone_real = await _resolver_lid_via_api(lid)
+            if telefone_real:
+                telefone = telefone_real
+                send_to = telefone_real
+                print(f"[INFO] LID {lid} resolvido automaticamente para {telefone_real}", flush=True)
+            else:
+                telefone = lid
+                send_to = remote_jid
+                print(f"[INFO] LID {lid} não resolvido — usando LID como identificador", flush=True)
+            LID_MAP[lid] = telefone
+            _save_lid_map(LID_MAP)
     elif remote_jid.endswith("@s.whatsapp.net"):
         telefone = remote_jid.replace("@s.whatsapp.net", "")
+        send_to = telefone
     else:
         return JSONResponse({"ok": True})
 
@@ -232,7 +336,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         for k in [k for k, v in _processed.items() if v < now - 300]:
             del _processed[k]
 
-    background_tasks.add_task(processar_mensagem, telefone, texto)
+    background_tasks.add_task(processar_mensagem, telefone, texto, send_to)
     return JSONResponse({"ok": True})
 
 @app.get("/health")

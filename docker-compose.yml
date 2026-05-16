@@ -12,12 +12,14 @@ services:
     volumes:
       - ./data:/app/data
       - ./credentials:/app/credentials:ro
+      - ./config.json:/app/config.json:ro
     environment:
       - PYTHONUNBUFFERED=1
       - FASTMCP_PORT=8001
       - FASTMCP_HOST=0.0.0.0
       - GOOGLE_CALENDAR_ID=${GOOGLE_CALENDAR_ID}
       - GOOGLE_CREDENTIALS_PATH=${GOOGLE_CREDENTIALS_PATH}
+      - CONFIG_PATH=/app/config.json
     networks:
       - barbershop_net
 
@@ -29,6 +31,8 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    volumes:
+      - ./config.json:/app/config.json:ro
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
@@ -36,6 +40,7 @@ services:
       - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
       - EVOLUTION_INSTANCE=${EVOLUTION_INSTANCE:-barbershop}
       - MCP_SERVER_URL=http://mcp_server:8001/mcp
+      - CONFIG_PATH=/app/config.json
     depends_on:
       - mcp_server
     networks:
