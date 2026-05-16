@@ -12,6 +12,7 @@ EVOLUTION_API_URL  = os.getenv("EVOLUTION_API_URL", "http://localhost:8080")
 EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "barbershop")
 MCP_SERVER_URL     = os.getenv("MCP_SERVER_URL", "http://localhost:8001/mcp")
+WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
 
 gemini_client = AsyncOpenAI(
     api_key=GEMINI_API_KEY,
@@ -329,6 +330,8 @@ async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
 
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
+    if WEBHOOK_SECRET and request.headers.get("apikey") != WEBHOOK_SECRET:
+        return JSONResponse({"ok": False}, status_code=403)
     try:
         body = await request.json()
     except Exception:

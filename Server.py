@@ -7,6 +7,7 @@ import os
 import json
 import sqlite3
 import uuid
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
@@ -49,6 +50,18 @@ DURACAO_SERVICO: dict = {
 }
 
 _calendar_svc = None
+
+async def _cal_retry(fn, max_attempts: int = 3):
+    """Executa uma chamada síncrona ao Google Calendar com backoff exponencial."""
+    last_exc: Exception
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2 ** attempt)
+    raise last_exc
 
 def get_calendar_service():
     global _calendar_svc
@@ -358,13 +371,14 @@ async def listar_horarios_disponiveis(params: ListarHorariosInput) -> str:
         day_end   = datetime(year, month, day, HORARIO_FECHAMENTO, 0, 0, tzinfo=SP_TZ)
 
         svc = get_calendar_service()
-        events = svc.events().list(
+        result = await _cal_retry(lambda: svc.events().list(
             calendarId=CALENDAR_ID,
             timeMin=day_start.isoformat(),
             timeMax=day_end.isoformat(),
             singleEvents=True,
             orderBy="startTime",
-        ).execute().get("items", [])
+        ).execute())
+        events = result.get("items", [])
 
         # Gera todos os slots de 30 min
         slots, t = [], day_start
@@ -436,7 +450,10 @@ async def agendar_corte(params: AgendarCorteInput) -> str:
             "start": {"dateTime": ev_start.isoformat(), "timeZone": "America/Sao_Paulo"},
             "end":   {"dateTime": ev_end.isoformat(),   "timeZone": "America/Sao_Paulo"},
         }
-        created = svc.events().insert(calendarId=CALENDAR_ID, body=event_body).execute()
+        created = await _cal_retry(
+            lambda: svc.events().insert(calendarId=CALENDAR_ID, body=event_body).execute(),
+            max_attempts=2,
+        )
         event_id = created["id"]
         data_hora = f"{params.data} {params.hora}:00"
         agora = datetime.now().isoformat()
