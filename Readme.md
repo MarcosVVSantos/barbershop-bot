@@ -1,226 +1,158 @@
-# 💈 Barbershop AI — WhatsApp + Claude + MCP
+# Barbershop MCP — WhatsApp Assistant Bot
 
-Sistema completo de atendimento inteligente para barbearia via WhatsApp, usando Claude como IA conversacional com MCP (Model Context Protocol) para gerenciar agendamentos, clientes, produtos e sugestões personalizadas de corte.
+Assistente virtual para WhatsApp com agendamento inteligente, integração com Google Calendar e suporte multi-tenant. Desenvolvido com FastAPI, FastMCP e Gemini como LLM.
 
----
-
-## 🏗️ Arquitetura
+## Arquitetura
 
 ```
-Cliente WhatsApp
-      │
-      ▼
-Evolution API  ←── webhook ──►  FastAPI Gateway  ──►  Claude API (claude-sonnet)
-(bridge WA)                          │                      │
-                                     │                      │ MCP tools
-                                     ▼                      ▼
-                               SQLite Database  ◄──  MCP Server (FastMCP)
-                               ├── clientes
-                               ├── agendamentos
-                               ├── produtos
-                               ├── pedidos
-                               ├── preferências
-                               ├── sessões
-                               └── catálogo de cortes (RAG)
+WhatsApp ↔ Evolution API (8082) → FastAPI Gateway (8000) → Gemini 2.5 Flash Lite
+                                          ↕ MCP JSON-RPC
+                                   MCP Server (8001)
+                                          ↕
+                              SQLite (data/barbershop.db)
+                              Google Calendar API
 ```
 
-### Componentes
-
-| Serviço | Porta | Função |
+| Componente | Arquivo | Responsabilidade |
 |---|---|---|
-| **Evolution API** | 8080 | Bridge WhatsApp ↔ REST API |
-| **FastAPI Gateway** | 8000 | Orquestra Claude + MCP, recebe webhooks |
-| **MCP Server** | 8001 | Ferramentas para Claude (banco de dados) |
+| Gateway | `Gateway.py` | Recebe webhooks, gerencia histórico, chama Gemini, despacha ferramentas MCP |
+| MCP Server | `Server.py` | 13 ferramentas MCP, SQLite, Google Calendar |
+| Config | `config.json` | Perfil do negócio (troca de tema sem alterar código) |
 
----
+## Funcionalidades
 
-## ✨ Funcionalidades
+- Agendamento e cancelamento via WhatsApp com validação de disponibilidade em tempo real
+- Integração bidirecional com Google Calendar (cria e deleta eventos)
+- Identificação automática de clientes (novo vs. recorrente) com UUID persistido
+- Pré-injeção de contexto: o LLM recebe cliente_id e IDs de agendamentos confirmados antes de responder — nunca inventa IDs
+- Resolução automática de JIDs `@lid` via Evolution API com persistência em `data/lid_map.json`
+- Sugestão de cortes, venda de produtos e registro de pedidos
+- Audit log de cancelamentos no SQLite
+- Multi-tenant: troque o perfil do negócio copiando um preset de `configs/`
 
-### Para o Cliente (via WhatsApp)
-- 🗓️ **Agendamento** — marcar, consultar e cancelar horários
-- ✂️ **Sugestão de cortes** — personalizada pelo histórico e preferências
-- 🧴 **Catálogo de produtos** — ver, pedir e retirar no dia do corte
-- 👤 **Perfil inteligente** — o bot lembra preferências entre sessões
-- 💬 **Conversa natural** — linguagem casual, como falar com o barbeiro
+## Pré-requisitos
 
-### Para o Barbeiro (admin)
-- 📊 **Relatório de período** — agendamentos, receita e produtos vendidos
-- 🧴 **Gestão de produtos** — cadastrar, editar estoque e preços
-- 📅 **Visão de agenda** — horários livres e ocupados por data
-- 👥 **Top clientes** — quem mais frequenta a barbearia
+- Docker e Docker Compose
+- Conta Google Cloud com Calendar API habilitada e uma service account
+- API Key do [Google AI Studio](https://aistudio.google.com) (Gemini) — tier pago recomendado
+- Evolution API key
 
----
+## Configuração rápida
 
-## 🚀 Como Subir (Docker)
-
-### 1. Clone e configure
 ```bash
-git clone <repo>
-cd barbershop-mcp
+git clone https://github.com/MarcosVVSantos/barbershop-bot.git
+cd barbershop-bot
+
 cp .env.example .env
-# Edite .env com suas credenciais
+# Edite o .env com suas credenciais
+
+cp configs/barbearia.json config.json   # ou nutricionista.json, adega.json
+
+# Coloque o JSON da service account do Google em:
+mkdir -p credentials
+cp /caminho/para/sua-service-account.json credentials/google-calendar.json
 ```
 
-### 2. Suba os containers
+### Variáveis de ambiente (`.env`)
+
+```env
+GEMINI_API_KEY=sua_chave_aqui
+GOOGLE_CALENDAR_ID=id_do_calendario@group.calendar.google.com
+GOOGLE_CREDENTIALS_PATH=/app/credentials/google-calendar.json
+EVOLUTION_API_KEY=sua_chave_evolution
+EVOLUTION_INSTANCE=barbershop
+```
+
+## Rodando com Docker
+
 ```bash
 docker compose up -d
 ```
 
-### 3. Configure a instância do WhatsApp
-```bash
-# Crie a instância
-curl -X POST http://localhost:8080/instance/create \
-  -H "apikey: $EVOLUTION_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"instanceName": "barbershop", "qrcode": true}'
+Acesse `http://localhost:8082` para configurar a instância WhatsApp na Evolution API e conectar via QR Code.
 
-# Escaneie o QR Code
-curl http://localhost:8080/instance/connect/barbershop \
-  -H "apikey: $EVOLUTION_API_KEY"
-# Abra a URL retornada e escaneie com o WhatsApp
-```
-
-### 4. Configure o webhook
-```bash
-curl -X POST http://localhost:8080/webhook/set/barbershop \
-  -H "apikey: $EVOLUTION_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "http://SEU_IP_OU_DOMINIO:8000/webhook",
-    "webhook_by_events": false,
-    "webhook_base64": false,
-    "events": ["MESSAGES_UPSERT"]
-  }'
-```
-
-> **Nota:** Em desenvolvimento local, use [ngrok](https://ngrok.com) para expor a porta 8000:
-> ```bash
-> ngrok http 8000
-> # Use a URL gerada no webhook acima
-> ```
-
----
-
-## 🔧 Desenvolvimento Local (sem Docker)
+## Rodando localmente (sem Docker)
 
 ```bash
-# Instale dependências
 pip install -r requirements.mcp.txt
 pip install -r requirements.gateway.txt
 
-# Terminal 1 — MCP Server
-cd mcp_server
-python server.py
+# Terminal 1
+python Server.py
 
-# Terminal 2 — Gateway
-cd gateway
-uvicorn gateway:app --reload --port 8000
+# Terminal 2
+uvicorn Gateway:app --reload --port 8000
 
 # Teste sem WhatsApp
-curl -X POST "http://localhost:8000/test-message?telefone=5511999999999&texto=Oi, quero agendar um corte"
+curl -X POST "http://localhost:8000/test-message?telefone=5511999999999&texto=Oi"
 ```
 
----
+Saúde dos serviços:
+```bash
+curl http://localhost:8000/health
+```
 
-## 🛠️ Ferramentas MCP Disponíveis
+## Multi-tenant — Perfis de negócio
 
-| Ferramenta | Descrição |
+Troque o perfil copiando um preset para `config.json` e recriando os containers:
+
+```bash
+cp configs/nutricionista.json config.json
+docker compose up -d --build
+```
+
+Presets disponíveis em `configs/`:
+
+| Arquivo | Negócio |
 |---|---|
-| `identificar_cliente` | Cadastra ou recupera cliente pelo telefone |
-| `listar_horarios_disponiveis` | Slots livres em uma data |
-| `agendar_corte` | Cria agendamento confirmado |
-| `cancelar_agendamento` | Cancela com motivo |
-| `atualizar_preferencias_cliente` | Salva preferências (corte, horário, etc) |
-| `sugerir_corte` | RAG: recomenda cortes pelo perfil e histórico |
-| `listar_produtos` | Catálogo de produtos com filtro |
-| `fazer_pedido_produto` | Pedido com retirada no corte ou na loja |
-| `historico_cliente` | Agendamentos, pedidos e preferências |
-| `salvar_mensagem_sessao` | Persiste mensagens para contexto |
-| `buscar_sessao` | Recupera histórico de conversa |
-| `relatorio_barbeiro` | Receita, agendamentos e top clientes |
-| `gerenciar_produto` | CRUD de produtos (admin) |
+| `barbearia.json` | Barbearia (padrão) |
+| `nutricionista.json` | Consultório de nutrição |
+| `adega.json` | Adega / loja de vinhos |
 
----
+## Banco de dados
 
-## 📱 Exemplos de Conversa
+SQLite em `data/barbershop.db` com WAL mode. Tabelas principais:
 
-```
-Cliente: Oi, quero marcar um corte
-Bot: Olá! 💈 Seja bem-vindo! Não te conheço ainda — qual é o seu nome?
+| Tabela | Conteúdo |
+|---|---|
+| `clientes` | Cadastro de clientes |
+| `agendamentos` | Agendamentos com ID do evento do Google Calendar |
+| `preferencias_cliente` | Preferências salvas pelo assistente |
+| `produtos` / `pedidos_produto` | Catálogo e pedidos |
+| `historico_sessao` | Histórico de conversa por telefone |
+| `audit_log` | Log imutável de cancelamentos e ações críticas |
 
-Cliente: João
-Bot: Oi João! ✂️ Que dia você quer vir?
-
-Cliente: Quinta-feira
-Bot: Na quinta (08/05), tenho esses horários disponíveis:
-     09:00 • 09:30 • 10:00 • 14:00 • 14:30 • 15:00
-     Qual prefere?
-
-Cliente: 14:30
-Bot: Perfeito! ✅ Agendado:
-     📅 Quinta, 08/05 às 14:30
-     ✂️ Serviço: Corte
-     
-     Aproveitando — você quer algum produto pra levar no dia?
-     Temos pomadas, óleos de barba e muito mais 🧴
-
-Cliente: Que pomadas vocês têm?
-Bot: Temos duas opções ótimas:
-     • *Pomada Matte Black* — R$ 45 | Fixação forte, acabamento fosco
-     • *Pomada Brilhosa Clássica* — R$ 40 | Fixação média, brilho intenso
-     
-     Quer reservar uma pra retirar no dia do seu corte? 😊
+Para resetar o banco:
+```bash
+docker exec barbershop_mcp python data/clean_db.py
+# ou
+rm data/barbershop.db
 ```
 
----
+## Ferramentas MCP disponíveis
 
-## 📂 Estrutura do Projeto
+`identificar_cliente` · `listar_horarios_disponiveis` · `agendar_corte` · `cancelar_agendamento` · `historico_cliente` · `atualizar_preferencias_cliente` · `sugerir_corte` · `listar_produtos` · `fazer_pedido_produto` · `buscar_sessao` · `salvar_mensagem_sessao`
+
+## Estrutura do projeto
 
 ```
-barbershop-mcp/
-├── mcp_server/
-│   └── server.py          # MCP Server com todas as ferramentas
-├── gateway/
-│   └── gateway.py         # FastAPI webhook + orquestração Claude
+.
+├── Gateway.py              # FastAPI + loop de agente Gemini
+├── Server.py               # FastMCP com 13 ferramentas
+├── config.json             # Perfil ativo do negócio
+├── configs/                # Presets de negócio
+│   ├── barbearia.json
+│   ├── nutricionista.json
+│   └── adega.json
+├── data/
+│   ├── barbershop.db       # SQLite (gerado automaticamente)
+│   └── lid_map.json        # Mapa LID → telefone (gerado automaticamente)
+├── credentials/
+│   └── google-calendar.json  # Service account (não commitado)
 ├── docker/
-│   ├── Dockerfile.mcp
-│   └── Dockerfile.gateway
-├── data/                  # SQLite (criado automaticamente)
+│   ├── Dockerfile.gateway
+│   └── Dockerfile.mcp
 ├── docker-compose.yml
-├── requirements.mcp.txt
 ├── requirements.gateway.txt
-├── .env.example
-└── README.md
+└── requirements.mcp.txt
 ```
-
----
-
-## 🔐 Variáveis de Ambiente
-
-| Variável | Descrição |
-|---|---|
-| `ANTHROPIC_API_KEY` | Chave da API Anthropic |
-| `EVOLUTION_API_KEY` | Chave da Evolution API |
-| `EVOLUTION_INSTANCE` | Nome da instância WhatsApp |
-| `EVOLUTION_API_URL` | URL da Evolution API |
-| `MCP_SERVER_URL` | URL do MCP Server |
-
----
-
-## 🗺️ Roadmap / Próximos Passos
-
-- [ ] **Notificações automáticas** — lembrete 1h antes do agendamento
-- [ ] **Fila de espera** — avisa quando abrir horário cancelado
-- [ ] **Pagamento via Pix** — integração com gateway de pagamento
-- [ ] **Fotos de cortes** — enviar imagens de referência
-- [ ] **Multi-barbeiro** — agenda separada por profissional
-- [ ] **Programa de fidelidade** — pontos por visita, desconto na 10ª
-- [ ] **Dashboard web** — painel admin para o barbeiro
-- [ ] **PostgreSQL** — migração do SQLite para produção escalável
-- [ ] **Redis** — cache de sessões para alta concorrência
-
----
-
-## 📄 Licença
-
-MIT — Use à vontade para o seu negócio! ✂️
