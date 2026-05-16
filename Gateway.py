@@ -3,18 +3,21 @@ from pathlib import Path
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 
 load_dotenv()
 
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 EVOLUTION_API_URL  = os.getenv("EVOLUTION_API_URL", "http://localhost:8080")
 EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "barbershop")
 MCP_SERVER_URL     = os.getenv("MCP_SERVER_URL", "http://localhost:8001/mcp")
 
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-MODEL = "llama-3.3-70b-versatile"
+gemini_client = AsyncOpenAI(
+    api_key=GEMINI_API_KEY,
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+)
+MODEL = "gemini-2.5-flash-lite"
 
 LID_MAP_FILE = Path("/app/data/lid_map.json")
 
@@ -91,16 +94,26 @@ def _build_system_prompt(cfg: dict) -> str:
 Servicos oferecidos: {servicos_str}
 A data de hoje e: {{hoje}}.
 
-REGRAS:
-1. Sempre use identificar_cliente no inicio com o telefone do cliente (somente telefone, sem nome)
-2. Se cliente novo (status='novo'), PERGUNTE o nome ao usuario ANTES de chamar identificar_cliente novamente. NUNCA use nomes genericos como 'Nome do cliente' ou 'Cliente' como nome real
-3. DATAS: Se o cliente informar apenas o dia (ex: 'dia 22'), assuma o mes e ano atuais. Se informar dia e mes sem ano, assuma o ano atual. Sempre converta para YYYY-MM-DD antes de usar nas ferramentas
-4. VALIDACAO DE HORARIO: Sempre chame listar_horarios_disponiveis antes de agendar. Se o horario pedido nao estiver na lista, informe o cliente e sugira os proximos horarios livres. Somente chame agendar_corte se o horario estiver disponivel
+REGRAS CRITICAS DE USO DE IDs:
+- O campo "id" retornado por identificar_cliente eh o cliente_id. Use EXATAMENTE esse UUID em todas as ferramentas que pedem cliente_id
+- NUNCA use o telefone como cliente_id. NUNCA invente IDs
+- O campo "id" dos agendamentos retornados por historico_cliente eh o agendamento_id para cancelar_agendamento
+- NUNCA peca IDs ao usuario — voce obtem tudo via ferramentas
+
+REGRA DE ACAO IMEDIATA:
+- Se voce precisa buscar informacao (historico, horarios, agendamentos), chame a ferramenta AGORA. NUNCA diga "vou buscar", "um minutinho", "so um segundo" sem chamar a ferramenta no mesmo momento. Acao primeiro, texto depois.
+
+REGRAS DE SEQUENCIA — chame UMA ferramenta por vez, aguarde o resultado antes de chamar a proxima:
+1. Sempre use identificar_cliente PRIMEIRO com o telefone (somente telefone, sem nome). Aguarde o resultado para obter o cliente_id
+2. Se cliente novo (status='novo'), PERGUNTE o nome ao usuario ANTES de chamar identificar_cliente novamente. NUNCA use nomes genericos
+3. DATAS: Se o cliente informar apenas o dia (ex: 'dia 22'), assuma o mes e ano atuais. Sempre converta para YYYY-MM-DD
+4. VALIDACAO DE HORARIO: Chame listar_horarios_disponiveis antes de agendar. Se o horario pedido nao estiver disponivel, sugira os proximos. Somente chame agendar_corte se o horario estiver disponivel
 5. Apos agendar_corte retornar sucesso, o agendamento esta CONCLUIDO. NAO chame agendar_corte de novo na mesma conversa
-6. CANCELAMENTO: Use historico_cliente para buscar agendamentos, apresente os futuros e pergunte qual cancelar. Apos confirmar, chame cancelar_agendamento
-7. Salve preferencias mencionadas pelo cliente
-8. Apos confirmar agendamento, ofereca produtos se houver. Se cliente recusar, despeça-se gentilmente
-9. Use emojis moderadamente{regras_extras_str}
+6. CANCELAMENTO: (1) identificar_cliente, (2) historico_cliente com o cliente_id obtido, (3) apresente os agendamentos ao cliente, (4) cancelar_agendamento com o id do agendamento escolhido. Nunca peca o ID ao usuario
+7. CANCELAR E REAGENDAR: execute em ordem: cancelar_agendamento → listar_horarios_disponiveis → agendar_corte. Nunca pule o cancelamento
+8. Salve preferencias mencionadas pelo cliente
+9. Apos confirmar agendamento, ofereca produtos se houver. Se cliente recusar, despeça-se gentilmente
+10. Use emojis moderadamente{regras_extras_str}
 """
 
 def _artigo(tipo: str) -> str:
@@ -207,6 +220,34 @@ async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
         historico = json.loads(historico_raw).get("historico", [])
         await call_mcp_tool("salvar_mensagem_sessao", {"telefone": telefone, "mensagem": texto, "papel": "user"})
 
+        # Identifica o cliente antes do loop — o LLM já recebe o contexto pronto
+        cliente_raw = await call_mcp_tool("identificar_cliente", {"telefone": telefone})
+        cliente_info = json.loads(cliente_raw)
+        if cliente_info.get("status") == "novo":
+            contexto_cliente = f"[CONTEXTO: cliente NOVO, telefone={telefone}. Pergunte o nome antes de qualquer acao]"
+        else:
+            c = cliente_info.get("cliente", {})
+            contexto_cliente = (
+                f"[CONTEXTO: cliente identificado — nome={c.get('nome')}, "
+                f"cliente_id={c.get('id')}, telefone={telefone}. "
+                f"Use este cliente_id em todas as ferramentas que precisarem dele]"
+            )
+            # Pre-fetch agendamentos confirmados para o LLM não inventar IDs
+            try:
+                hist_raw = await call_mcp_tool("historico_cliente", {"cliente_id": c.get("id"), "limite": 5})
+                hist_data = json.loads(hist_raw)
+                agendamentos = hist_data.get("agendamentos", [])
+                futuros = [a for a in agendamentos if a.get("status") == "confirmado"]
+                if futuros:
+                    ags_str = "; ".join(
+                        f"id={a['id']} data={a['data_hora']} servico={a['servico']}"
+                        for a in futuros
+                    )
+                    contexto_cliente += f". Agendamentos confirmados: [{ags_str}]"
+            except Exception as e:
+                print(f"[WARN] Pre-fetch historico_cliente falhou: {e}", flush=True)
+        print(f"[DEBUG] {contexto_cliente}", flush=True)
+
         from datetime import date
         prompt = SYSTEM_PROMPT.format(hoje=date.today().strftime("%d/%m/%Y"))
         messages = [{"role": "system", "content": prompt}]
@@ -214,8 +255,8 @@ async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
             role = "user" if h["papel"] == "user" else "assistant"
             messages.append({"role": role, "content": h["mensagem"]})
 
-        msg_com_telefone = f"[telefone do cliente: {telefone}] {texto}"
-        messages.append({"role": "user", "content": msg_com_telefone})
+        msg_com_contexto = f"{contexto_cliente}\nMensagem do cliente: {texto}"
+        messages.append({"role": "user", "content": msg_com_contexto})
 
         resposta_final = ""
 
@@ -223,12 +264,12 @@ async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
             print(f"[DEBUG] Chamando Groq iter={i}", flush=True)
             for tentativa in range(3):
                 try:
-                    response = await groq_client.chat.completions.create(
+                    response = await gemini_client.chat.completions.create(
                         model=MODEL,
                         messages=messages,
                         tools=GROQ_TOOLS,
-                        tool_choice="auto",
-                        parallel_tool_calls=False
+                        tool_choice="required" if i == 0 else "auto",
+                        parallel_tool_calls=False,
                     )
                     break
                 except Exception as e:
@@ -238,7 +279,10 @@ async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
                     raise
             print(f"[DEBUG] Groq respondeu iter={i}", flush=True)
 
-            msg = response.choices[0].message
+            choice = response.choices[0]
+            msg = choice.message
+            finish_reason = choice.finish_reason
+            print(f"[DEBUG] finish_reason={finish_reason} tool_calls={bool(msg.tool_calls)} content={repr(msg.content)[:80]}", flush=True)
 
             if msg.tool_calls:
                 assistant_msg = {
@@ -267,19 +311,21 @@ async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
         if not resposta_final:
             resposta_final = "Desculpa, tive um problema. Pode repetir?"
 
-        destino = send_to or telefone
         await call_mcp_tool("salvar_mensagem_sessao", {"telefone": telefone, "mensagem": resposta_final, "papel": "assistant"})
-        await send_whatsapp_message(destino, resposta_final)
-        print(f"[OK] Resposta enviada para {destino}: {resposta_final[:80]}", flush=True)
+        if send_to:
+            await send_whatsapp_message(send_to, resposta_final)
+            print(f"[OK] Resposta enviada para {send_to}: {resposta_final[:80]}", flush=True)
+        else:
+            print(f"[WARN] Resposta gerada mas sem destino de envio para {telefone}", flush=True)
 
     except Exception as e:
         msg_erro = str(e)
         print(f"[ERRO] processar_mensagem: {msg_erro}", flush=True)
-        destino = send_to or telefone
-        if "429" in msg_erro or "rate_limit" in msg_erro:
-            await send_whatsapp_message(destino, "Estou sobrecarregado agora, tenta em alguns minutinhos! ⏳")
-        else:
-            await send_whatsapp_message(destino, "Desculpa, tive um problema tecnico. Tenta de novo!")
+        if send_to:
+            if "429" in msg_erro or "rate_limit" in msg_erro:
+                await send_whatsapp_message(send_to, "Estou sobrecarregado agora, tenta em alguns minutinhos! ⏳")
+            else:
+                await send_whatsapp_message(send_to, "Desculpa, tive um problema tecnico. Tenta de novo!")
 
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
@@ -310,9 +356,10 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 send_to = telefone_real
                 print(f"[INFO] LID {lid} resolvido automaticamente para {telefone_real}", flush=True)
             else:
+                # Sem telefone real: salva LID para referência mas não pode enviar resposta
                 telefone = lid
-                send_to = remote_jid
-                print(f"[INFO] LID {lid} não resolvido — usando LID como identificador", flush=True)
+                send_to = None
+                print(f"[WARN] LID {lid} não resolvido — mensagem processada mas resposta não pode ser enviada. Adicione manualmente em data/lid_map.json", flush=True)
             LID_MAP[lid] = telefone
             _save_lid_map(LID_MAP)
     elif remote_jid.endswith("@s.whatsapp.net"):

@@ -32,10 +32,10 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./data:/app/data
       - ./config.json:/app/config.json:ro
     environment:
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - EVOLUTION_API_URL=http://evolution_api:8080
       - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
       - EVOLUTION_INSTANCE=${EVOLUTION_INSTANCE:-barbershop}
