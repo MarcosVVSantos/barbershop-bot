@@ -1,24 +1,37 @@
-import os, json, time, httpx
+import os, sys, json, time, httpx, asyncio, sqlite3
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 from pathlib import Path
+from contextlib import asynccontextmanager
+from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 load_dotenv()
 
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
+DEEPSEEK_API_KEY   = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL  = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 EVOLUTION_API_URL  = os.getenv("EVOLUTION_API_URL", "http://localhost:8080")
 EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "barbershop")
 MCP_SERVER_URL     = os.getenv("MCP_SERVER_URL", "http://localhost:8001/mcp")
 WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
+BARBEIRO_PHONE      = os.getenv("BARBEIRO_PHONE", "")
+DIAS_INATIVIDADE    = int(os.getenv("DIAS_INATIVIDADE", "30"))
+HORARIO_RECUPERACAO = int(os.getenv("HORARIO_RECUPERACAO", "10"))
+DB_PATH             = Path(os.getenv("DB_PATH", "/app/data/barbershop.db"))
 
-gemini_client = AsyncOpenAI(
-    api_key=GEMINI_API_KEY,
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+deepseek_client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url=DEEPSEEK_BASE_URL,
 )
-MODEL = "gemini-2.5-flash-lite"
+MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 LID_MAP_FILE = Path("/app/data/lid_map.json")
 
@@ -113,8 +126,14 @@ REGRAS DE SEQUENCIA — chame UMA ferramenta por vez, aguarde o resultado antes 
 6. CANCELAMENTO: (1) identificar_cliente, (2) historico_cliente com o cliente_id obtido, (3) apresente os agendamentos ao cliente, (4) cancelar_agendamento com o id do agendamento escolhido. Nunca peca o ID ao usuario
 7. CANCELAR E REAGENDAR: execute em ordem: cancelar_agendamento → listar_horarios_disponiveis → agendar_corte. Nunca pule o cancelamento
 8. Salve preferencias mencionadas pelo cliente
-9. Apos confirmar agendamento, ofereca produtos se houver. Se cliente recusar, despeça-se gentilmente
-10. Use emojis moderadamente{regras_extras_str}
+9. FLUXO DE PRODUTOS — execute em ordem quando cliente demonstrar interesse em produto:
+   a) Chame listar_produtos para buscar o catalogo atualizado com IDs reais
+   b) Apresente os produtos com nome e preco (nao invente valores)
+   c) Se cliente quiser comprar, chame fazer_pedido_produto com o produto_id correto do catalogo
+   d) Confirme: "Ótimo! [Produto] (R$XX) separado para voce retirar na visita. Pagamento na barbearia!"
+   e) NUNCA invente produto_id — use sempre o id retornado por listar_produtos
+10. Apos confirmar agendamento, ofereca produtos se houver. Se cliente recusar, despeça-se gentilmente
+11. Use emojis moderadamente{regras_extras_str}
 """
 
 def _artigo(tipo: str) -> str:
@@ -123,6 +142,29 @@ def _artigo(tipo: str) -> str:
 
 _cfg = _load_config()
 SYSTEM_PROMPT = _build_system_prompt(_cfg)
+
+ADMIN_SYSTEM_PROMPT = """Voce eh o assistente de gestao da barbearia. O usuario eh o BARBEIRO/DONO.
+Responda de forma DIRETA e COMPACTA — estilo painel de controle no WhatsApp. Sem papo de atendimento.
+A data de hoje e: {hoje}.
+
+COMANDOS DISPONIVEIS:
+- "agenda" ou "agenda hoje" → chame agenda_hoje sem parametros
+- "agenda DD/MM" ou "agenda amanha" → chame agenda_hoje com a data convertida para YYYY-MM-DD
+- "pedidos" ou "pedidos pendentes" → chame listar_pedidos_pendentes com apenas_hoje=true
+- "relatorio" ou "relatorio da semana" → chame relatorio_barbeiro com data_inicio=7 dias atras e data_fim=hoje (formato YYYY-MM-DD)
+- "top clientes" → chame top_clientes com limite=5
+- "estoque" → chame listar_produtos com apenas_disponiveis=false
+- "add estoque [produto] [qtd]" → chame atualizar_estoque com modo="adicionar" e a quantidade informada
+- "estoque [produto] [qtd]" (com numero) → chame atualizar_estoque com modo="definir" e a quantidade informada
+- "sem estoque [produto]" → chame atualizar_estoque com modo="zerar" e quantidade=0
+- "recuperar clientes" ou "recuperar clientes [N] dias" → chame recuperar_clientes com dias=N (padrao 30)
+
+FORMATO DAS RESPOSTAS (compacto, sem texto desnecessario):
+- Use emojis como icones de secao: 📅 agenda, 📦 pedidos, 📊 relatorio, 👥 clientes, 🧴 estoque
+- Liste itens um por linha com dados essenciais
+- Sem saudacoes longas, sem perguntas, sem despedidas
+- Se nao reconhecer o comando, liste os comandos disponiveis
+"""
 
 TOOLS = [
     {"name":"identificar_cliente","description":"Identifica ou cadastra cliente pelo WhatsApp. SEMPRE chame no inicio.","parameters":{"type":"object","properties":{"telefone":{"type":"string"},"nome":{"type":"string"}},"required":["telefone"]}},
@@ -133,17 +175,84 @@ TOOLS = [
     {"name":"sugerir_corte","description":"Sugere cortes pelo perfil.","parameters":{"type":"object","properties":{"descricao":{"type":"string"},"cliente_id":{"type":"string"}},"required":["descricao"]}},
     {"name":"listar_produtos","description":"Lista produtos da barbearia.","parameters":{"type":"object","properties":{"categoria":{"type":"string"},"apenas_disponiveis":{"type":"boolean"}}}},
     {"name":"fazer_pedido_produto","description":"Registra pedido de produto.","parameters":{"type":"object","properties":{"cliente_id":{"type":"string"},"produto_id":{"type":"string"},"quantidade":{"type":"integer"},"retirada":{"type":"string"},"agendamento_id":{"type":"string"}},"required":["cliente_id","produto_id"]}},
+    {"name":"listar_pedidos_pendentes","description":"Lista pedidos de produtos pendentes/confirmados para o barbeiro ver durante o atendimento.","parameters":{"type":"object","properties":{"status":{"type":"string"},"apenas_hoje":{"type":"boolean"}}}},
+    {"name":"agenda_hoje","description":"Lista agendamentos de um dia para o barbeiro. Data opcional (padrao hoje).","parameters":{"type":"object","properties":{"data":{"type":"string"}}}},
+    {"name":"top_clientes","description":"Top clientes por frequencia de visitas.","parameters":{"type":"object","properties":{"limite":{"type":"integer"}}}},
+    {"name":"relatorio_barbeiro","description":"Relatorio de agendamentos e receita do periodo.","parameters":{"type":"object","properties":{"data_inicio":{"type":"string"},"data_fim":{"type":"string"}},"required":["data_inicio","data_fim"]}},
     {"name":"historico_cliente","description":"Historico do cliente.","parameters":{"type":"object","properties":{"cliente_id":{"type":"string"},"limite":{"type":"integer"}},"required":["cliente_id"]}},
     {"name":"buscar_sessao","description":"Historico de conversa.","parameters":{"type":"object","properties":{"telefone":{"type":"string"},"limite":{"type":"integer"}},"required":["telefone"]}},
     {"name":"salvar_mensagem_sessao","description":"Salva mensagem na sessao.","parameters":{"type":"object","properties":{"telefone":{"type":"string"},"mensagem":{"type":"string"},"papel":{"type":"string"}},"required":["telefone","mensagem","papel"]}}
 ]
 
-GROQ_TOOLS = [
+ADMIN_TOOLS = [
+    {"type":"function","function":{"name":"agenda_hoje","description":"Lista agendamentos do dia para o barbeiro.","parameters":{"type":"object","properties":{"data":{"type":"string"}}}}},
+    {"type":"function","function":{"name":"listar_pedidos_pendentes","description":"Lista pedidos de produtos pendentes/confirmados.","parameters":{"type":"object","properties":{"status":{"type":"string"},"apenas_hoje":{"type":"boolean"}}}}},
+    {"type":"function","function":{"name":"relatorio_barbeiro","description":"Relatorio do periodo: agendamentos, receita e produtos.","parameters":{"type":"object","properties":{"data_inicio":{"type":"string"},"data_fim":{"type":"string"}},"required":["data_inicio","data_fim"]}}},
+    {"type":"function","function":{"name":"top_clientes","description":"Top clientes por frequencia.","parameters":{"type":"object","properties":{"limite":{"type":"integer"}}}}},
+    {"type":"function","function":{"name":"listar_produtos","description":"Lista produtos com estoque.","parameters":{"type":"object","properties":{"categoria":{"type":"string"},"apenas_disponiveis":{"type":"boolean"}}}}},
+    {"type":"function","function":{"name":"atualizar_estoque","description":"Atualiza estoque de um produto pelo nome.","parameters":{"type":"object","properties":{"nome_produto":{"type":"string"},"quantidade":{"type":"integer"},"modo":{"type":"string","enum":["adicionar","definir","zerar"]}},"required":["nome_produto","modo"]}}},
+    {"type":"function","function":{"name":"recuperar_clientes","description":"Envia mensagem de recuperacao no WhatsApp para clientes inativos ha mais de N dias.","parameters":{"type":"object","properties":{"dias":{"type":"integer","description":"Dias de inatividade (padrao 30)"}}}}},
+]
+
+LLM_TOOLS = [
     {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
     for t in TOOLS
 ]
 
-app = FastAPI()
+async def enviar_recuperacao_clientes(dias: int = None):
+    if dias is None:
+        dias = DIAS_INATIVIDADE
+    print(f"[SCHEDULER] Iniciando recuperacao de clientes inativos (dias={dias})", flush=True)
+    try:
+        raw = await call_mcp_tool("listar_clientes_inativos", {"dias": dias, "limite": 100})
+        data = json.loads(raw)
+        clientes = data.get("clientes", [])
+        print(f"[SCHEDULER] {len(clientes)} clientes inativos encontrados", flush=True)
+        agora = datetime.now().isoformat()
+        enviados = 0
+        for c in clientes:
+            telefone = c.get("telefone", "")
+            nome = c.get("nome", "")
+            if not telefone:
+                continue
+            mensagem = (
+                f"Oi {nome}! Faz um tempinho que voce nao aparece por aqui. "
+                f"Temos novidades na barbearia e queremos te ver! "
+                f"Que tal agendar um horario? E so mandar uma mensagem. Te esperamos! ✂️"
+            )
+            await send_whatsapp_message(telefone, mensagem)
+            try:
+                conn_rec = sqlite3.connect(str(DB_PATH))
+                conn_rec.execute(
+                    "UPDATE clientes SET ultima_recuperacao_em = ? WHERE id = ?",
+                    (agora, c["id"])
+                )
+                conn_rec.commit()
+                conn_rec.close()
+            except Exception as db_e:
+                print(f"[WARN] Falha ao atualizar ultima_recuperacao_em: {db_e}", flush=True)
+            enviados += 1
+        print(f"[SCHEDULER] Recuperacao concluida: {enviados} mensagens enviadas", flush=True)
+    except Exception as e:
+        print(f"[ERRO] enviar_recuperacao_clientes: {e}", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
+    scheduler.add_job(
+        enviar_recuperacao_clientes,
+        CronTrigger(hour=HORARIO_RECUPERACAO, minute=0),
+        id="recuperacao_clientes",
+        replace_existing=True,
+    )
+    scheduler.start()
+    print(f"[SCHEDULER] Agendado: recuperacao diaria as {HORARIO_RECUPERACAO}:00 SP", flush=True)
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
 
 _mcp_session_id: str | None = None
 
@@ -216,69 +325,82 @@ async def send_whatsapp_message(numero: str, texto: str):
 
 async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
     print(f"[DEBUG] Iniciando processamento para {telefone}: {texto}", flush=True)
+    is_barbeiro = bool(BARBEIRO_PHONE and telefone == BARBEIRO_PHONE)
     try:
         historico_raw = await call_mcp_tool("buscar_sessao", {"telefone": telefone, "limite": 20})
         historico = json.loads(historico_raw).get("historico", [])
         await call_mcp_tool("salvar_mensagem_sessao", {"telefone": telefone, "mensagem": texto, "papel": "user"})
 
-        # Identifica o cliente antes do loop — o LLM já recebe o contexto pronto
-        cliente_raw = await call_mcp_tool("identificar_cliente", {"telefone": telefone})
-        cliente_info = json.loads(cliente_raw)
-        if cliente_info.get("status") == "novo":
-            contexto_cliente = f"[CONTEXTO: cliente NOVO, telefone={telefone}. Pergunte o nome antes de qualquer acao]"
-        else:
-            c = cliente_info.get("cliente", {})
-            contexto_cliente = (
-                f"[CONTEXTO: cliente identificado — nome={c.get('nome')}, "
-                f"cliente_id={c.get('id')}, telefone={telefone}. "
-                f"Use este cliente_id em todas as ferramentas que precisarem dele]"
-            )
-            # Pre-fetch agendamentos confirmados para o LLM não inventar IDs
-            try:
-                hist_raw = await call_mcp_tool("historico_cliente", {"cliente_id": c.get("id"), "limite": 5})
-                hist_data = json.loads(hist_raw)
-                agendamentos = hist_data.get("agendamentos", [])
-                futuros = [a for a in agendamentos if a.get("status") == "confirmado"]
-                if futuros:
-                    ags_str = "; ".join(
-                        f"id={a['id']} data={a['data_hora']} servico={a['servico']}"
-                        for a in futuros
-                    )
-                    contexto_cliente += f". Agendamentos confirmados: [{ags_str}]"
-            except Exception as e:
-                print(f"[WARN] Pre-fetch historico_cliente falhou: {e}", flush=True)
-        print(f"[DEBUG] {contexto_cliente}", flush=True)
-
         from datetime import date
-        prompt = SYSTEM_PROMPT.format(hoje=date.today().strftime("%d/%m/%Y"))
-        messages = [{"role": "system", "content": prompt}]
-        for h in historico:
-            role = "user" if h["papel"] == "user" else "assistant"
-            messages.append({"role": role, "content": h["mensagem"]})
+        hoje_fmt = date.today().strftime("%d/%m/%Y")
+        hoje_iso = date.today().strftime("%Y-%m-%d")
 
-        msg_com_contexto = f"{contexto_cliente}\nMensagem do cliente: {texto}"
-        messages.append({"role": "user", "content": msg_com_contexto})
+        if is_barbeiro:
+            print(f"[DEBUG] Modo BARBEIRO ativado", flush=True)
+            prompt = ADMIN_SYSTEM_PROMPT.format(hoje=hoje_fmt)
+            tools_list = ADMIN_TOOLS
+            messages = [{"role": "system", "content": prompt}]
+            for h in historico:
+                role = "user" if h["papel"] == "user" else "assistant"
+                messages.append({"role": role, "content": h["mensagem"]})
+            messages.append({"role": "user", "content": texto})
+        else:
+            # Identifica o cliente antes do loop — o LLM já recebe o contexto pronto
+            cliente_raw = await call_mcp_tool("identificar_cliente", {"telefone": telefone})
+            cliente_info = json.loads(cliente_raw)
+            if cliente_info.get("status") == "novo":
+                contexto_cliente = f"[CONTEXTO: cliente NOVO, telefone={telefone}. Pergunte o nome antes de qualquer acao]"
+            else:
+                c = cliente_info.get("cliente", {})
+                contexto_cliente = (
+                    f"[CONTEXTO: cliente identificado — nome={c.get('nome')}, "
+                    f"cliente_id={c.get('id')}, telefone={telefone}. "
+                    f"Use este cliente_id em todas as ferramentas que precisarem dele]"
+                )
+                try:
+                    hist_raw = await call_mcp_tool("historico_cliente", {"cliente_id": c.get("id"), "limite": 5})
+                    hist_data = json.loads(hist_raw)
+                    agendamentos = hist_data.get("agendamentos", [])
+                    futuros = [a for a in agendamentos if a.get("status") == "confirmado"]
+                    if futuros:
+                        ags_str = "; ".join(
+                            f"id={a['id']} data={a['data_hora']} servico={a['servico']}"
+                            for a in futuros
+                        )
+                        contexto_cliente += f". Agendamentos confirmados: [{ags_str}]"
+                except Exception as e:
+                    print(f"[WARN] Pre-fetch historico_cliente falhou: {e}", flush=True)
+            print(f"[DEBUG] {contexto_cliente}", flush=True)
+
+            prompt = SYSTEM_PROMPT.format(hoje=hoje_fmt)
+            tools_list = LLM_TOOLS
+            messages = [{"role": "system", "content": prompt}]
+            for h in historico:
+                role = "user" if h["papel"] == "user" else "assistant"
+                messages.append({"role": role, "content": h["mensagem"]})
+            msg_com_contexto = f"{contexto_cliente}\nMensagem do cliente: {texto}"
+            messages.append({"role": "user", "content": msg_com_contexto})
 
         resposta_final = ""
 
         for i in range(10):
-            print(f"[DEBUG] Chamando Groq iter={i}", flush=True)
+            print(f"[DEBUG] Chamando DeepSeek iter={i}", flush=True)
             for tentativa in range(3):
                 try:
-                    response = await gemini_client.chat.completions.create(
+                    response = await deepseek_client.chat.completions.create(
                         model=MODEL,
                         messages=messages,
-                        tools=GROQ_TOOLS,
+                        tools=tools_list,
                         tool_choice="required" if i == 0 else "auto",
                         parallel_tool_calls=False,
                     )
                     break
                 except Exception as e:
                     if "tool_use_failed" in str(e) and tentativa < 2:
-                        print(f"[WARN] Groq tool_use_failed, tentativa {tentativa+1}/3", flush=True)
+                        print(f"[WARN] DeepSeek tool_use_failed, tentativa {tentativa+1}/3", flush=True)
                         continue
                     raise
-            print(f"[DEBUG] Groq respondeu iter={i}", flush=True)
+            print(f"[DEBUG] DeepSeek respondeu iter={i}", flush=True)
 
             choice = response.choices[0]
             msg = choice.message
@@ -305,7 +427,15 @@ async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
             for tc in msg.tool_calls:
                 args = json.loads(tc.function.arguments)
                 print(f"[DEBUG] Tool call: {tc.function.name}({args})", flush=True)
-                resultado = await call_mcp_tool(tc.function.name, args)
+                if tc.function.name == "recuperar_clientes":
+                    dias_rec = int(args.get("dias", DIAS_INATIVIDADE))
+                    asyncio.create_task(enviar_recuperacao_clientes(dias_rec))
+                    resultado = json.dumps({
+                        "status": "iniciado",
+                        "mensagem": f"Recuperacao de clientes inativos ha mais de {dias_rec} dias iniciada em segundo plano."
+                    }, ensure_ascii=False)
+                else:
+                    resultado = await call_mcp_tool(tc.function.name, args)
                 print(f"[DEBUG] Tool result: {resultado[:100]}", flush=True)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": resultado})
 
@@ -359,10 +489,10 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 send_to = telefone_real
                 print(f"[INFO] LID {lid} resolvido automaticamente para {telefone_real}", flush=True)
             else:
-                # Sem telefone real: salva LID para referência mas não pode enviar resposta
+                # LID não resolvido: usa o JID @lid diretamente — Evolution API aceita para envio
                 telefone = lid
-                send_to = None
-                print(f"[WARN] LID {lid} não resolvido — mensagem processada mas resposta não pode ser enviada. Adicione manualmente em data/lid_map.json", flush=True)
+                send_to = remote_jid
+                print(f"[INFO] LID {lid} não resolvido via API, enviando resposta direto para {remote_jid}", flush=True)
             LID_MAP[lid] = telefone
             _save_lid_map(LID_MAP)
     elif remote_jid.endswith("@s.whatsapp.net"):

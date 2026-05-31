@@ -175,6 +175,11 @@ def init_db(conn: sqlite3.Connection):
     );
     """)
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE clientes ADD COLUMN ultima_recuperacao_em TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # coluna já existe
     _seed_produtos(conn)
     _seed_cortes(conn)
 
@@ -280,6 +285,30 @@ class RelatorioBarbeiroInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
     data_inicio: str = Field(..., description="Data de início no formato 'YYYY-MM-DD'")
     data_fim: str = Field(..., description="Data de fim no formato 'YYYY-MM-DD'")
+
+class ListarPedidosPendentesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    status: Optional[str] = Field(None, description="Filtrar por status: 'pendente', 'confirmado', 'entregue', 'cancelado'. Se omitido, retorna pendentes e confirmados.")
+    apenas_hoje: bool = Field(True, description="Se True, retorna apenas pedidos criados hoje.")
+
+class AtualizarEstoqueInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    nome_produto: str = Field(..., description="Nome ou parte do nome do produto (busca case-insensitive)")
+    quantidade: int = Field(0, description="Quantidade a usar conforme o modo", ge=0)
+    modo: str = Field(..., description="'adicionar' soma ao estoque atual | 'definir' substitui o valor | 'zerar' zera o estoque")
+
+class AgendaHojeInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    data: Optional[str] = Field(None, description="Data no formato YYYY-MM-DD. Se omitida, usa hoje.")
+
+class TopClientesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    limite: int = Field(5, description="Quantidade de clientes a retornar", ge=1, le=20)
+
+class ListarClientesInativosInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    dias: int = Field(30, description="Inativo ha mais de N dias sem visita", ge=1, le=365)
+    limite: int = Field(50, description="Maximo de clientes retornados", ge=1, le=200)
 
 class SalvarSessaoInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
@@ -720,6 +749,183 @@ async def fazer_pedido_produto(params: FazerPedidoInput) -> str:
 
 
 @mcp.tool(
+    name="listar_pedidos_pendentes",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+)
+async def listar_pedidos_pendentes(params: ListarPedidosPendentesInput) -> str:
+    """Lista pedidos de produtos para o barbeiro consultar durante o atendimento.
+
+    Retorna pedidos com nome do cliente, produto, quantidade, preço e horário do agendamento vinculado.
+
+    Args:
+        params: ListarPedidosPendentesInput com filtro de status e flag apenas_hoje.
+
+    Returns:
+        JSON com: pedidos (list), total (int).
+    """
+    conn = get_db()
+    try:
+        hoje = datetime.now().strftime("%Y-%m-%d")
+
+        status_filter = params.status if params.status else None
+        args: list = []
+
+        query = """
+            SELECT
+                pp.id,
+                pp.status,
+                pp.quantidade,
+                pp.retirada,
+                pp.criado_em,
+                pp.agendamento_id,
+                c.nome  AS cliente_nome,
+                c.telefone AS cliente_telefone,
+                pr.nome AS produto_nome,
+                pr.preco AS produto_preco,
+                ag.data_hora AS agendamento_data_hora,
+                ag.servico   AS agendamento_servico
+            FROM pedidos_produto pp
+            JOIN clientes c  ON pp.cliente_id  = c.id
+            JOIN produtos  pr ON pp.produto_id  = pr.id
+            LEFT JOIN agendamentos ag ON pp.agendamento_id = ag.id
+            WHERE 1=1
+        """
+
+        if status_filter:
+            query += " AND pp.status = ?"
+            args.append(status_filter)
+        else:
+            query += " AND pp.status IN ('pendente', 'confirmado')"
+
+        if params.apenas_hoje:
+            query += " AND DATE(pp.criado_em) = ?"
+            args.append(hoje)
+
+        query += " ORDER BY pp.criado_em DESC"
+
+        pedidos = rows_to_list(conn.execute(query, args).fetchall())
+        return json.dumps({"pedidos": pedidos, "total": len(pedidos)}, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="atualizar_estoque",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
+)
+async def atualizar_estoque(params: AtualizarEstoqueInput) -> str:
+    """Atualiza o estoque de um produto buscando pelo nome. Uso exclusivo do barbeiro.
+
+    Args:
+        params: AtualizarEstoqueInput com nome_produto, quantidade e modo.
+
+    Returns:
+        JSON com: sucesso, nome, estoque_anterior, estoque_novo.
+    """
+    conn = get_db()
+    try:
+        produto = row_to_dict(conn.execute(
+            "SELECT * FROM produtos WHERE LOWER(nome) LIKE LOWER(?) LIMIT 1",
+            (f"%{params.nome_produto}%",)
+        ).fetchone() or {})
+
+        if not produto:
+            return json.dumps({"sucesso": False, "erro": f"Produto '{params.nome_produto}' não encontrado."}, ensure_ascii=False)
+
+        estoque_anterior = produto["estoque"]
+
+        if params.modo == "zerar":
+            novo_estoque = 0
+        elif params.modo == "adicionar":
+            novo_estoque = estoque_anterior + params.quantidade
+        elif params.modo == "definir":
+            novo_estoque = params.quantidade
+        else:
+            return json.dumps({"sucesso": False, "erro": "Modo inválido. Use: 'adicionar', 'definir' ou 'zerar'."}, ensure_ascii=False)
+
+        conn.execute("UPDATE produtos SET estoque = ? WHERE id = ?", (novo_estoque, produto["id"]))
+        conn.commit()
+
+        return json.dumps({
+            "sucesso": True,
+            "nome": produto["nome"],
+            "estoque_anterior": estoque_anterior,
+            "estoque_novo": novo_estoque
+        }, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="agenda_hoje",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+)
+async def agenda_hoje(params: AgendaHojeInput) -> str:
+    """Lista todos os agendamentos de um dia para o barbeiro consultar.
+
+    Args:
+        params: AgendaHojeInput com data opcional (padrão: hoje).
+
+    Returns:
+        JSON com: data, agendamentos (hora, cliente, servico, status), total.
+    """
+    conn = get_db()
+    try:
+        data = params.data or datetime.now().strftime("%Y-%m-%d")
+        rows = rows_to_list(conn.execute(
+            """SELECT
+                   strftime('%H:%M', a.data_hora) AS hora,
+                   c.nome  AS cliente,
+                   c.telefone AS telefone,
+                   a.servico,
+                   a.status,
+                   a.observacoes
+               FROM agendamentos a
+               JOIN clientes c ON a.cliente_id = c.id
+               WHERE DATE(a.data_hora) = ? AND a.status != 'cancelado'
+               ORDER BY a.data_hora""",
+            (data,)
+        ).fetchall())
+        return json.dumps({"data": data, "agendamentos": rows, "total": len(rows)}, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="top_clientes",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+)
+async def top_clientes(params: TopClientesInput) -> str:
+    """Retorna os clientes mais frequentes da barbearia por total de visitas.
+
+    Args:
+        params: TopClientesInput com limite (padrão 5).
+
+    Returns:
+        JSON com: clientes (nome, total_visitas, ultimo_agendamento).
+    """
+    conn = get_db()
+    try:
+        rows = rows_to_list(conn.execute(
+            """SELECT
+                   c.nome,
+                   c.telefone,
+                   COUNT(*) AS total_visitas,
+                   MAX(a.data_hora) AS ultimo_agendamento
+               FROM agendamentos a
+               JOIN clientes c ON a.cliente_id = c.id
+               WHERE a.status != 'cancelado'
+               GROUP BY c.id
+               ORDER BY total_visitas DESC
+               LIMIT ?""",
+            (params.limite,)
+        ).fetchall())
+        return json.dumps({"clientes": rows, "total": len(rows)}, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
+@mcp.tool(
     name="historico_cliente",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 )
@@ -934,6 +1140,36 @@ async def gerenciar_produto(params: GerenciarProdutoInput) -> str:
             conn.commit()
             produto = row_to_dict(conn.execute("SELECT * FROM produtos WHERE id = ?", (params.produto_id,)).fetchone() or {})
             return json.dumps({"sucesso": True, "acao": "atualizado", "produto": produto}, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
+@mcp.tool(
+    name="listar_clientes_inativos",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+)
+async def listar_clientes_inativos(params: ListarClientesInativosInput) -> str:
+    """Lista clientes sem visita ha mais de N dias e que ainda nao receberam mensagem de recuperacao recente.
+
+    Args:
+        params: ListarClientesInativosInput com dias e limite.
+
+    Returns:
+        JSON com: clientes (list com id, nome, telefone, ultima_visita, total_visitas), total, dias_inatividade.
+    """
+    conn = get_db()
+    try:
+        corte = (datetime.now() - timedelta(days=params.dias)).isoformat()
+        rows = rows_to_list(conn.execute(
+            """SELECT id, nome, telefone, ultima_visita, total_visitas, ultima_recuperacao_em
+               FROM clientes
+               WHERE (ultima_visita IS NULL OR ultima_visita < ?)
+               AND (ultima_recuperacao_em IS NULL OR ultima_recuperacao_em < ?)
+               ORDER BY ultima_visita ASC
+               LIMIT ?""",
+            (corte, corte, params.limite)
+        ).fetchall())
+        return json.dumps({"clientes": rows, "total": len(rows), "dias_inatividade": params.dias}, ensure_ascii=False)
     finally:
         conn.close()
 

@@ -35,12 +35,18 @@ services:
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
     environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - BARBEIRO_PHONE=${BARBEIRO_PHONE}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
       - EVOLUTION_API_URL=http://evolution_api:8080
       - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
       - EVOLUTION_INSTANCE=${EVOLUTION_INSTANCE:-barbershop}
       - MCP_SERVER_URL=http://mcp_server:8001/mcp
       - CONFIG_PATH=/app/config.json
+      - DIAS_INATIVIDADE=${DIAS_INATIVIDADE:-30}
+      - HORARIO_RECUPERACAO=${HORARIO_RECUPERACAO:-10}
+      - DB_PATH=/app/data/barbershop.db
     depends_on:
       - mcp_server
     networks:

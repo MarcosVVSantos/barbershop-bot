@@ -1,6 +1,6 @@
-﻿"""
+"""
 Gateway FastAPI — recebe webhooks do WhatsApp (via Evolution API),
-orquestra Gemini com function calling para as ferramentas da barbearia.
+orquestra DeepSeek V3 com function calling para as ferramentas da barbearia.
 """
 
 import os
@@ -9,17 +9,22 @@ import httpx
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-import google.generativeai as genai
+from openai import AsyncOpenAI
 
 load_dotenv()
 
-GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "")
+DEEPSEEK_API_KEY    = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL   = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 EVOLUTION_API_URL   = os.getenv("EVOLUTION_API_URL", "http://localhost:8080")
 EVOLUTION_API_KEY   = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE  = os.getenv("EVOLUTION_INSTANCE", "barbershop")
 MCP_SERVER_URL      = os.getenv("MCP_SERVER_URL", "http://localhost:8001/mcp")
 
-genai.configure(api_key=GEMINI_API_KEY)
+deepseek_client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url=DEEPSEEK_BASE_URL,
+)
+MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 SYSTEM_PROMPT = """Voce eh o assistente virtual da barbearia, um atendente simpatico,
 profissional e descontraido que fala portugues brasileiro naturalmente.
@@ -48,7 +53,12 @@ TOOLS = [
     {"name": "salvar_mensagem_sessao", "description": "Salva mensagem na sessao.", "parameters": {"type": "object", "properties": {"telefone": {"type": "string"}, "mensagem": {"type": "string"}, "papel": {"type": "string"}}, "required": ["telefone", "mensagem", "papel"]}}
 ]
 
-app = FastAPI(title="Barbershop Gateway Gemini", version="2.0.0")
+LLM_TOOLS = [
+    {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
+    for t in TOOLS
+]
+
+app = FastAPI(title="Barbershop Gateway DeepSeek", version="2.0.0")
 
 async def call_mcp_tool(tool_name: str, arguments: dict) -> str:
     async with httpx.AsyncClient(timeout=15.0) as http:
@@ -80,28 +90,42 @@ async def processar_mensagem(telefone: str, texto: str):
         historico_raw = await call_mcp_tool("buscar_sessao", {"telefone": telefone, "limite": 20})
         historico = json.loads(historico_raw).get("historico", [])
         await call_mcp_tool("salvar_mensagem_sessao", {"telefone": telefone, "mensagem": texto, "papel": "user"})
-        history = []
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         for h in historico:
-            role = "user" if h["papel"] == "user" else "model"
-            history.append({"role": role, "parts": [{"text": h["mensagem"]}]})
+            role = "user" if h["papel"] == "user" else "assistant"
+            messages.append({"role": role, "content": h["mensagem"]})
         primeira_mensagem = f"[Telefone do cliente: {telefone}]\n{texto}" if not historico else texto
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_PROMPT, tools=[{"function_declarations": TOOLS}])
-        chat = model.start_chat(history=history)
-        response = chat.send_message(primeira_mensagem)
+        messages.append({"role": "user", "content": primeira_mensagem})
+
         resposta_final = ""
         for _ in range(10):
-            tool_calls = [p.function_call for p in response.parts if hasattr(p, "function_call") and p.function_call.name]
-            if not tool_calls:
-                for part in response.parts:
-                    if hasattr(part, "text") and part.text:
-                        resposta_final += part.text
+            response = await deepseek_client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=LLM_TOOLS,
+                tool_choice="auto",
+                parallel_tool_calls=False,
+            )
+            choice = response.choices[0]
+            msg = choice.message
+            if not msg.tool_calls:
+                resposta_final = msg.content or ""
                 break
-            tool_results = []
-            for fc in tool_calls:
-                args = dict(fc.args) if fc.args else {}
-                resultado = await call_mcp_tool(fc.name, args)
-                tool_results.append({"function_response": {"name": fc.name, "response": {"result": resultado}}})
-            response = chat.send_message(tool_results)
+            assistant_msg = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ]
+            }
+            messages.append(assistant_msg)
+            for tc in msg.tool_calls:
+                args = json.loads(tc.function.arguments)
+                resultado = await call_mcp_tool(tc.function.name, args)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": resultado})
+
         if not resposta_final:
             resposta_final = "Desculpa, tive um problema aqui. Pode repetir?"
         await call_mcp_tool("salvar_mensagem_sessao", {"telefone": telefone, "mensagem": resposta_final, "papel": "assistant"})
@@ -133,7 +157,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "gemini-1.5-flash"}
+    return {"status": "ok", "engine": MODEL}
 
 @app.post("/test-message")
 async def test_message(telefone: str, texto: str, background_tasks: BackgroundTasks):

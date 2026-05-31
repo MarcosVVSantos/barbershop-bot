@@ -15,7 +15,7 @@ WhatsApp ↔ Evolution API (port 8082) → FastAPI Gateway (port 8000) → Groq 
                                    Google Calendar API
 ```
 
-- **`Gateway.py`** — FastAPI app. Receives Evolution API webhooks, manages conversation history via MCP session, calls Groq (`llama-3.3-70b-versatile`) with tool definitions, dispatches MCP tool calls, sends WhatsApp replies.
+- **`Gateway.py`** — FastAPI app. Receives Evolution API webhooks, manages conversation history via MCP session, calls DeepSeek (`deepseek-chat`) with tool definitions, dispatches MCP tool calls, sends WhatsApp replies.
 - **`Server.py`** — FastMCP server. Implements all 13 MCP tools as async functions. Owns the SQLite schema and Google Calendar integration. Runs on port 8001 with `streamable-http` transport.
 - **`data/barbershop.db`** — SQLite with WAL mode. Tables: `clientes`, `preferencias_cliente`, `agendamentos`, `produtos`, `pedidos_produto`, `historico_sessao`, `catalogo_cortes`.
 
@@ -53,7 +53,9 @@ After containers start, create and connect the WhatsApp instance via Evolution A
 
 | Variable | Purpose |
 |---|---|
-| `GROQ_API_KEY` | LLM provider (Groq, not Anthropic) |
+| `DEEPSEEK_API_KEY` | LLM provider (DeepSeek V3) |
+| `DEEPSEEK_BASE_URL` | DeepSeek API base URL (default: `https://api.deepseek.com`) |
+| `DEEPSEEK_MODEL` | Model name (default: `deepseek-chat`) |
 | `GOOGLE_CALENDAR_ID` | Calendar for availability checks |
 | `GOOGLE_CREDENTIALS_PATH` | Path to service account JSON |
 | `EVOLUTION_API_KEY` | WhatsApp bridge authentication |
