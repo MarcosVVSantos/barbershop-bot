@@ -51,6 +51,7 @@ services:
       - DB_PATH=/app/data/barbershop.db
       - BARBERSHOPS_PATH=/app/barbershops.yaml
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
+      - GATEWAY_URL=http://gateway:8000
     depends_on:
       - mcp_server
     networks:

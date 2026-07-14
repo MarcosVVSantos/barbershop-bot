@@ -518,8 +518,30 @@ async def lifespan(app_: FastAPI):
     print("[SCHEDULER] Agendado: lembretes_confirmacao a cada 30 min (:00/:30)", flush=True)
     print(f"[SCHEDULER] Agendado: resumo_dia as {_horario_resumo} SP", flush=True)
     print("[SCHEDULER] Agendado: relatorio_mensal no dia 1 de cada mes as 09:00 SP", flush=True)
+
+    # Registra webhook na Evolution API ao subir (persiste mesmo após restart)
+    await _registrar_webhook()
     yield
     scheduler.shutdown()
+
+
+async def _registrar_webhook():
+    if not EVOLUTION_API_URL or not EVOLUTION_API_KEY:
+        return
+    webhook_url = os.getenv("GATEWAY_URL", "http://gateway:8000") + "/webhook"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.post(
+                f"{EVOLUTION_API_URL}/webhook/set/{EVOLUTION_INSTANCE}",
+                headers={"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"},
+                json={"url": webhook_url, "webhook_by_events": False, "webhook_base64": False, "events": ["MESSAGES_UPSERT"]},
+            )
+            if r.status_code in (200, 201):
+                print(f"[STARTUP] Webhook registrado: {webhook_url}", flush=True)
+            else:
+                print(f"[WARN] Webhook não registrado: {r.status_code} {r.text[:100]}", flush=True)
+    except Exception as e:
+        print(f"[WARN] Falha ao registrar webhook: {e}", flush=True)
 
 
 app = FastAPI(lifespan=lifespan)
