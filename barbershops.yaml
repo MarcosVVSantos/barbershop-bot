@@ -1,0 +1,21 @@
+# Configuração multi-tenant das barbearias
+# Cada entrada representa uma barbearia / instância do bot.
+# Campos em branco herdam de env vars (BARBEIRO_PHONE, EVOLUTION_INSTANCE, etc.).
+barbershops:
+  - id: default
+    nome: ""                        # sobrescrito por config.json > negocio.nome
+    dono_phone: ""                  # telefone do dono — sobrescreve BARBEIRO_PHONE
+    evolution_instance: ""          # sobrescreve EVOLUTION_INSTANCE
+    horario_abertura: 9
+    horario_fechamento: 19
+    timezone: "America/Sao_Paulo"
+    precos_servico:
+      corte: 35.0
+      barba: 35.0
+      "corte+barba": 65.0
+      progressiva: 120.0
+    jobs:
+      confirmacao_antecedencia_horas: 3   # FASE 2: horas antes do horário para lembrete
+      horario_recuperacao: 10             # hora do dia para job de recuperação de inativos
+      horario_resumo_dia: "19:30"         # FASE 3: fechamento + 30 min para resumo do dia
+      dias_inatividade: 30                # dias sem visita para considerar inativo

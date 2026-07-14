@@ -34,7 +34,7 @@ _cfg = _load_config()
 _atendimento = _cfg.get("atendimento", {})
 
 # ─── Constantes ───────────────────────────────────────────────────────────────
-DB_PATH = Path(__file__).parent.parent / "data" / "barbershop.db"
+DB_PATH = Path(os.getenv("DB_PATH", str(Path(__file__).parent / "data" / "barbershop.db")))
 HORARIO_ABERTURA  = _atendimento.get("horario_abertura", 9)
 HORARIO_FECHAMENTO = _atendimento.get("horario_fechamento", 19)
 DURACAO_CORTE_MIN  = _atendimento.get("intervalo_minutos", 30)
@@ -46,6 +46,12 @@ CREDENTIALS_PATH  = Path(os.getenv("GOOGLE_CREDENTIALS_PATH", "/app/credentials/
 DURACAO_SERVICO: dict = {
     k.lower(): v for k, v in _cfg.get("servicos", {
         "corte+barba": 60, "progressiva": 60, "corte": 30, "barba": 30,
+    }).items()
+}
+
+PRECO_SERVICO: dict = {
+    k.lower(): float(v) for k, v in _cfg.get("precos_servico", {
+        "corte": 35.0, "barba": 35.0, "corte+barba": 65.0, "progressiva": 120.0,
     }).items()
 }
 
@@ -180,8 +186,41 @@ def init_db(conn: sqlite3.Connection):
         conn.commit()
     except sqlite3.OperationalError:
         pass  # coluna já existe
+
+    # FASE 1: novas colunas de agendamento
+    for _col_sql in [
+        "ALTER TABLE agendamentos ADD COLUMN valor REAL",
+        "ALTER TABLE agendamentos ADD COLUMN confirmado_em TEXT",
+        "ALTER TABLE agendamentos ADD COLUMN lembrete_enviado_em TEXT",
+    ]:
+        try:
+            conn.execute(_col_sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
     _seed_produtos(conn)
     _seed_cortes(conn)
+
+    # FASE 1: migração de status — passado vira concluido, futuro vira agendado
+    _agora = datetime.now(SP_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "UPDATE agendamentos SET status = 'concluido'"
+        " WHERE data_hora < ? AND status NOT IN ('cancelado', 'concluido', 'no_show')",
+        (_agora,),
+    )
+    conn.execute(
+        "UPDATE agendamentos SET status = 'agendado'"
+        " WHERE data_hora >= ? AND status IN ('pendente', 'confirmado')",
+        (_agora,),
+    )
+    # Popula valor onde estiver NULL, usando tabela de preços
+    for _srv, _preco in PRECO_SERVICO.items():
+        conn.execute(
+            "UPDATE agendamentos SET valor = ? WHERE valor IS NULL AND LOWER(servico) = ?",
+            (_preco, _srv),
+        )
+    conn.commit()
 
 def _seed_produtos(conn: sqlite3.Connection):
     """Insere produtos do config.json se o catálogo estiver vazio."""
@@ -487,9 +526,11 @@ async def agendar_corte(params: AgendarCorteInput) -> str:
         data_hora = f"{params.data} {params.hora}:00"
         agora = datetime.now().isoformat()
 
+        valor = PRECO_SERVICO.get(params.servico.lower(), 0.0)
         conn.execute(
-            "INSERT INTO agendamentos (id, cliente_id, data_hora, servico, status, observacoes, criado_em) VALUES (?,?,?,?,?,?,?)",
-            (event_id, params.cliente_id, data_hora, params.servico, "confirmado", params.observacoes or "", agora)
+            "INSERT INTO agendamentos (id, cliente_id, data_hora, servico, status, valor, observacoes, criado_em)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (event_id, params.cliente_id, data_hora, params.servico, "agendado", valor, params.observacoes or "", agora)
         )
         conn.execute(
             "UPDATE clientes SET ultima_visita = ?, total_visitas = total_visitas + 1 WHERE id = ?",
@@ -498,7 +539,7 @@ async def agendar_corte(params: AgendarCorteInput) -> str:
         conn.execute(
             "INSERT INTO audit_log (id, entidade, entidade_id, acao, detalhes, criado_em) VALUES (?,?,?,?,?,?)",
             (str(uuid.uuid4()), "agendamento", event_id, "criado",
-             json.dumps({"cliente_id": params.cliente_id, "cliente": cliente["nome"], "data_hora": data_hora, "servico": params.servico}, ensure_ascii=False),
+             json.dumps({"cliente_id": params.cliente_id, "cliente": cliente["nome"], "data_hora": data_hora, "servico": params.servico, "valor": valor}, ensure_ascii=False),
              agora)
         )
         conn.commit()
@@ -510,7 +551,8 @@ async def agendar_corte(params: AgendarCorteInput) -> str:
                 "cliente": cliente["nome"],
                 "data_hora": data_hora,
                 "servico": params.servico,
-                "status": "confirmado",
+                "status": "agendado",
+                "valor": valor,
                 "calendar_link": created.get("htmlLink", ""),
             }
         }, ensure_ascii=False)
@@ -1170,6 +1212,359 @@ async def listar_clientes_inativos(params: ListarClientesInativosInput) -> str:
             (corte, corte, params.limite)
         ).fetchall())
         return json.dumps({"clientes": rows, "total": len(rows), "dias_inatividade": params.dias}, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
+class ResponderConfirmacaoInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    agendamento_id: str = Field(..., description="ID do agendamento aguardando confirmação")
+    confirmou: bool = Field(..., description="True se o cliente confirmou presença, False se vai cancelar")
+
+
+@mcp.tool(
+    name="responder_confirmacao",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+)
+async def responder_confirmacao(params: ResponderConfirmacaoInput) -> str:
+    """Registra a resposta do cliente ao lembrete de confirmação enviado pelo sistema.
+
+    Deve ser chamado quando o contexto indicar AGUARDANDO CONFIRMAÇÃO e o cliente
+    responder se vai comparecer ou não. Não usar para cancelamentos iniciados pelo cliente
+    fora do fluxo de lembrete — nesses casos use cancelar_agendamento.
+
+    Returns:
+        JSON com: sucesso, status (confirmado|cancelado), data_hora, notificar_barbeiro.
+    """
+    conn = get_db()
+    try:
+        row = row_to_dict(conn.execute(
+            "SELECT * FROM agendamentos WHERE id = ?", (params.agendamento_id,)
+        ).fetchone() or {})
+        if not row:
+            return json.dumps({"sucesso": False, "erro": "Agendamento não encontrado."}, ensure_ascii=False)
+
+        agora = datetime.now(SP_TZ).isoformat()
+
+        if params.confirmou:
+            conn.execute(
+                "UPDATE agendamentos SET status = 'confirmado', confirmado_em = ? WHERE id = ?",
+                (agora, params.agendamento_id),
+            )
+            novo_status = "confirmado"
+            notificar_barbeiro = False
+        else:
+            # Cancela e remove do Google Calendar
+            try:
+                svc = get_calendar_service()
+                await _cal_retry(
+                    lambda: svc.events().delete(calendarId=CALENDAR_ID, eventId=params.agendamento_id).execute(),
+                    max_attempts=2,
+                )
+            except Exception:
+                pass
+            conn.execute(
+                "UPDATE agendamentos SET status = 'cancelado' WHERE id = ?",
+                (params.agendamento_id,),
+            )
+            novo_status = "cancelado"
+            notificar_barbeiro = True
+
+        conn.execute(
+            "INSERT INTO audit_log (id, entidade, entidade_id, acao, detalhes, criado_em) VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "agendamento", params.agendamento_id, novo_status,
+             json.dumps({"via": "lembrete_confirmacao", "data_hora": row["data_hora"], "servico": row["servico"]}, ensure_ascii=False),
+             agora),
+        )
+        conn.commit()
+
+        return json.dumps({
+            "sucesso": True,
+            "status": novo_status,
+            "data_hora": row["data_hora"],
+            "servico": row["servico"],
+            "notificar_barbeiro": notificar_barbeiro,
+        }, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
+class MarcarNoShowInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    agendamento_id: Optional[str] = Field(None, description="ID do agendamento a marcar como no-show")
+    data_hora: Optional[str] = Field(None, description="Data e hora no formato 'YYYY-MM-DD HH:MM' para localizar o agendamento")
+    nome: Optional[str] = Field(None, description="Nome parcial do cliente para buscar no agendamento de hoje (para resposta ao resumo diário)")
+
+
+@mcp.tool(
+    name="marcar_no_show",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+)
+async def marcar_no_show(params: MarcarNoShowInput) -> str:
+    """Marca um agendamento como no_show (cliente faltou sem avisar). Uso exclusivo do barbeiro.
+
+    Aceita agendamento_id, data_hora ou nome do cliente (busca no dia de hoje).
+    Use nome= ao processar a resposta do barbeiro ao resumo diário (ex: "João faltou").
+    Ao contrário de cancelar, no_show preserva o registro para métricas de perda.
+
+    Returns:
+        JSON com: sucesso (bool), agendamento (dict com status atualizado).
+    """
+    conn = get_db()
+    try:
+        agora = datetime.now(SP_TZ).isoformat()
+
+        if params.agendamento_id:
+            row = row_to_dict(conn.execute(
+                "SELECT * FROM agendamentos WHERE id = ?", (params.agendamento_id,)
+            ).fetchone() or {})
+        elif params.data_hora:
+            # aceita "YYYY-MM-DD HH:MM" ou "YYYY-MM-DD HH:MM:SS"
+            prefixo = params.data_hora[:16]  # "YYYY-MM-DD HH:MM"
+            row = row_to_dict(conn.execute(
+                "SELECT * FROM agendamentos WHERE data_hora LIKE ? AND status NOT IN ('cancelado', 'no_show')",
+                (f"{prefixo}%",)
+            ).fetchone() or {})
+        elif params.nome:
+            hoje = datetime.now(SP_TZ).strftime("%Y-%m-%d")
+            row = row_to_dict(conn.execute(
+                """SELECT a.* FROM agendamentos a
+                   JOIN clientes c ON a.cliente_id = c.id
+                   WHERE DATE(a.data_hora) = ?
+                     AND LOWER(c.nome) LIKE LOWER(?)
+                     AND a.status NOT IN ('cancelado', 'no_show')
+                   ORDER BY a.data_hora LIMIT 1""",
+                (hoje, f"%{params.nome}%")
+            ).fetchone() or {})
+        else:
+            return json.dumps({"sucesso": False, "erro": "Informe agendamento_id, data_hora ou nome."}, ensure_ascii=False)
+
+        if not row:
+            return json.dumps({"sucesso": False, "erro": "Agendamento não encontrado."}, ensure_ascii=False)
+        if row.get("status") == "no_show":
+            return json.dumps({"sucesso": True, "mensagem": "Já marcado como no-show.", "agendamento": row}, ensure_ascii=False)
+
+        conn.execute(
+            "UPDATE agendamentos SET status = 'no_show' WHERE id = ?",
+            (row["id"],)
+        )
+        conn.execute(
+            "INSERT INTO audit_log (id, entidade, entidade_id, acao, detalhes, criado_em) VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "agendamento", row["id"], "no_show",
+             json.dumps({"data_hora": row["data_hora"], "servico": row["servico"], "valor": row.get("valor")}, ensure_ascii=False),
+             agora)
+        )
+        conn.commit()
+        row["status"] = "no_show"
+        return json.dumps({"sucesso": True, "agendamento": row}, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
+# ─── Helpers de métricas (FASE 4) ────────────────────────────────────────────
+
+_MES_NOME = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
+    5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
+    9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro",
+}
+
+
+def _periodo(ano: int, mes: int) -> tuple:
+    import calendar
+    ultimo = calendar.monthrange(ano, mes)[1]
+    return (f"{ano:04d}-{mes:02d}-01 00:00:00",
+            f"{ano:04d}-{mes:02d}-{ultimo:02d} 23:59:59")
+
+
+def _fat(conn, ano: int, mes: int) -> dict:
+    inicio, fim = _periodo(ano, mes)
+    r = conn.execute(
+        "SELECT COALESCE(SUM(valor),0) AS t, COUNT(*) AS n FROM agendamentos"
+        " WHERE status='concluido' AND data_hora BETWEEN ? AND ?",
+        (inicio, fim),
+    ).fetchone()
+    t, n = float(r[0]), int(r[1])
+    return {"total": t, "n": n, "ticket": t / n if n else 0.0}
+
+
+def _variacao_pct(conn, ano: int, mes: int) -> float:
+    atual = _fat(conn, ano, mes)["total"]
+    ano_ant, mes_ant = (ano - 1, 12) if mes == 1 else (ano, mes - 1)
+    anterior = _fat(conn, ano_ant, mes_ant)["total"]
+    if anterior == 0:
+        return 0.0
+    return round((atual - anterior) / anterior * 100, 1)
+
+
+def _clientes_novos(conn, ano: int, mes: int) -> int:
+    inicio, fim = _periodo(ano, mes)
+    r = conn.execute(
+        """SELECT COUNT(DISTINCT a.cliente_id) FROM agendamentos a
+           WHERE a.status='concluido' AND a.data_hora BETWEEN ? AND ?
+             AND NOT EXISTS (SELECT 1 FROM agendamentos a2
+                             WHERE a2.cliente_id=a.cliente_id
+                               AND a2.status='concluido' AND a2.data_hora < ?)""",
+        (inicio, fim, inicio),
+    ).fetchone()
+    return int(r[0])
+
+
+def _clientes_recorrentes(conn, ano: int, mes: int) -> int:
+    inicio, fim = _periodo(ano, mes)
+    r = conn.execute(
+        """SELECT COUNT(DISTINCT a.cliente_id) FROM agendamentos a
+           WHERE a.status='concluido' AND a.data_hora BETWEEN ? AND ?
+             AND EXISTS (SELECT 1 FROM agendamentos a2
+                         WHERE a2.cliente_id=a.cliente_id
+                           AND a2.status='concluido' AND a2.data_hora < ?)""",
+        (inicio, fim, inicio),
+    ).fetchone()
+    return int(r[0])
+
+
+def _sumidos(conn, dias: int = 45) -> int:
+    corte = (datetime.now(SP_TZ) - timedelta(days=dias)).strftime("%Y-%m-%d %H:%M:%S")
+    r = conn.execute(
+        """SELECT COUNT(*) FROM (
+             SELECT cliente_id, MAX(data_hora) AS ultima
+             FROM agendamentos WHERE status='concluido' GROUP BY cliente_id
+           ) WHERE ultima < ?""",
+        (corte,),
+    ).fetchone()
+    return int(r[0])
+
+
+def _recuperados(conn, ano: int, mes: int) -> dict:
+    """Clientes que receberam lembrete de recuperação E agendaram concluido em até 30 dias."""
+    inicio, fim = _periodo(ano, mes)
+    r = conn.execute(
+        """SELECT COUNT(DISTINCT c.id), COALESCE(SUM(a.valor), 0)
+           FROM clientes c JOIN agendamentos a ON a.cliente_id=c.id
+           WHERE c.ultima_recuperacao_em IS NOT NULL
+             AND a.status='concluido'
+             AND a.data_hora >= c.ultima_recuperacao_em
+             AND a.data_hora <= datetime(c.ultima_recuperacao_em, '+30 days')
+             AND a.data_hora BETWEEN ? AND ?""",
+        (inicio, fim),
+    ).fetchone()
+    return {"n": int(r[0]), "valor": float(r[1])}
+
+
+def _no_show_metricas(conn, ano: int, mes: int) -> dict:
+    inicio, fim = _periodo(ano, mes)
+    r = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(valor),0) FROM agendamentos"
+        " WHERE status='no_show' AND data_hora BETWEEN ? AND ?",
+        (inicio, fim),
+    ).fetchone()
+    return {"n": int(r[0]), "valor": float(r[1])}
+
+
+def _horario_ocioso(conn, ano: int, mes: int, abertura: int = 9, fechamento: int = 19) -> str:
+    """Faixa de 2h + dia da semana com menor número de atendimentos no mês."""
+    inicio, fim = _periodo(ano, mes)
+    rows = conn.execute(
+        """SELECT strftime('%w', data_hora) AS d, CAST(strftime('%H', data_hora) AS INTEGER) AS h
+           FROM agendamentos
+           WHERE status IN ('concluido','no_show') AND data_hora BETWEEN ? AND ?""",
+        (inicio, fim),
+    ).fetchall()
+
+    BLOCO = 2
+    # Blocos alinhados a horas pares cobrindo o horário de funcionamento
+    counts: dict = {}
+    for _d in range(7):
+        for _h in range(abertura, fechamento):
+            _b = (_h // BLOCO) * BLOCO
+            if (_d, _b) not in counts:
+                counts[(_d, _b)] = 0
+    for r in rows:
+        d, h = int(r[0]), int(r[1])
+        b = (h // BLOCO) * BLOCO
+        if (d, b) in counts:
+            counts[(d, b)] += 1
+
+    if not any(counts.values()):
+        return "dados insuficientes"
+
+    (dia_sem, bloco), _ = min(counts.items(), key=lambda x: x[1])
+    DIAS = ["domingo", "segunda-feira", "terça-feira", "quarta-feira",
+            "quinta-feira", "sexta-feira", "sábado"]
+    return f"{DIAS[dia_sem]} {bloco:02d}h-{bloco+BLOCO:02d}h"
+
+
+class RelatorioMensalInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    ano: Optional[int] = Field(None, description="Ano YYYY. Default: mês atual")
+    mes: Optional[int] = Field(None, description="Mês 1-12. Default: mês atual")
+
+
+@mcp.tool(
+    name="gerar_relatorio_mensal",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+)
+async def gerar_relatorio_mensal(params: RelatorioMensalInput) -> str:
+    """Gera o relatório mensal com todas as métricas de negócio da barbearia.
+
+    Sem parâmetros retorna o parcial do mês corrente. Com ano/mes retorna o relatório
+    completo do período especificado.
+
+    Returns:
+        JSON com: relatorio (texto formatado para WhatsApp), metricas (dict com valores brutos).
+    """
+    conn = get_db()
+    try:
+        agora = datetime.now(SP_TZ)
+        ano = params.ano or agora.year
+        mes = params.mes or agora.month
+
+        fat   = _fat(conn, ano, mes)
+        var   = _variacao_pct(conn, ano, mes)
+        novos = _clientes_novos(conn, ano, mes)
+        rec_c = _clientes_recorrentes(conn, ano, mes)
+        sum_c = _sumidos(conn)
+        recup = _recuperados(conn, ano, mes)
+        ns    = _no_show_metricas(conn, ano, mes)
+        ocio  = _horario_ocioso(conn, ano, mes, HORARIO_ABERTURA, HORARIO_FECHAMENTO)
+
+        nome_neg = _cfg.get("negocio", {}).get("nome", "Barbearia")
+        nome_mes = _MES_NOME.get(mes, str(mes))
+        var_str  = f"{var:+.1f}%" if fat["total"] > 0 else "primeiro mês"
+
+        relatorio = (
+            f"📊 *Resumo de {nome_mes} — {nome_neg}*\n\n"
+            f"💰 Faturamento: R$ {fat['total']:.2f} ({var_str} vs mês anterior)\n"
+            f"✂️ {fat['n']} atendimentos | Ticket médio: R$ {fat['ticket']:.2f}\n\n"
+            f"👥 Clientes:\n"
+            f"• {novos} novos\n"
+            f"• {rec_c} recorrentes\n"
+            f"• {sum_c} sumidos há +45 dias\n\n"
+            f"✅ Recuperados pelo sistema: {recup['n']} clientes\n"
+            f"   → R$ {recup['valor']:.2f} que voltaram pro caixa\n\n"
+            f"⚠️ No-show: {ns['n']} horários (R$ ~{ns['valor']:.2f} perdidos)\n"
+            f"📅 Horário mais ocioso: {ocio}\n\n"
+            f"_Responda RELATORIO pra ver mais detalhes_"
+        )
+
+        return json.dumps({
+            "relatorio": relatorio,
+            "metricas": {
+                "ano": ano, "mes": mes,
+                "faturamento": fat["total"],
+                "n_atendimentos": fat["n"],
+                "ticket_medio": fat["ticket"],
+                "variacao_pct": var,
+                "clientes_novos": novos,
+                "clientes_recorrentes": rec_c,
+                "sumidos": sum_c,
+                "recuperados_n": recup["n"],
+                "recuperados_valor": recup["valor"],
+                "no_show_n": ns["n"],
+                "no_show_valor": ns["valor"],
+                "horario_ocioso": ocio,
+            },
+        }, ensure_ascii=False)
     finally:
         conn.close()
 

@@ -1,17 +1,23 @@
-import os, sys, json, time, httpx, asyncio, sqlite3
+import os, sys, json, time, httpx, asyncio, sqlite3, uuid
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 from pathlib import Path
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+try:
+    import yaml as _yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
 
 load_dotenv()
 
@@ -26,6 +32,34 @@ BARBEIRO_PHONE      = os.getenv("BARBEIRO_PHONE", "")
 DIAS_INATIVIDADE    = int(os.getenv("DIAS_INATIVIDADE", "30"))
 HORARIO_RECUPERACAO = int(os.getenv("HORARIO_RECUPERACAO", "10"))
 DB_PATH             = Path(os.getenv("DB_PATH", "/app/data/barbershop.db"))
+SP_TZ               = ZoneInfo("America/Sao_Paulo")
+
+# ── Configuração multi-tenant (barbershops.yaml) ──────────────────────────────
+_BARBERSHOPS_PATH = Path(os.getenv("BARBERSHOPS_PATH", "/app/barbershops.yaml"))
+
+def _load_shop_config() -> dict:
+    """Lê barbershops.yaml e retorna config do tenant 'default'."""
+    if not _HAS_YAML or not _BARBERSHOPS_PATH.exists():
+        return {}
+    try:
+        with open(_BARBERSHOPS_PATH, encoding="utf-8") as f:
+            data = _yaml.safe_load(f)
+        shops = data.get("barbershops", [])
+        return next((s for s in shops if s.get("id") == "default"), shops[0] if shops else {})
+    except Exception as e:
+        print(f"[WARN] Erro ao ler barbershops.yaml: {e}", flush=True)
+        return {}
+
+_shop_cfg = _load_shop_config()
+_jobs_cfg = _shop_cfg.get("jobs", {})
+
+# Env vars têm precedência; barbershops.yaml preenche o que estiver vazio
+if not BARBEIRO_PHONE and _shop_cfg.get("dono_phone"):
+    BARBEIRO_PHONE = _shop_cfg["dono_phone"]
+if _shop_cfg.get("evolution_instance"):
+    EVOLUTION_INSTANCE = _shop_cfg["evolution_instance"] or EVOLUTION_INSTANCE
+DIAS_INATIVIDADE    = int(_jobs_cfg.get("dias_inatividade", DIAS_INATIVIDADE))
+HORARIO_RECUPERACAO = int(_jobs_cfg.get("horario_recuperacao", HORARIO_RECUPERACAO))
 
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -100,7 +134,7 @@ def _build_system_prompt(cfg: dict) -> str:
     regras_extras_str = ""
     if extras:
         regras_extras_str = "\n" + "\n".join(
-            f"{10 + i}. {r}" for i, r in enumerate(extras)
+            f"{12 + i}. {r}" for i, r in enumerate(extras)
         )
 
     return f"""Voce eh o assistente virtual d{_artigo(negocio.get('tipo',''))} {nome}, {tom}, em portugues brasileiro.
@@ -133,7 +167,8 @@ REGRAS DE SEQUENCIA — chame UMA ferramenta por vez, aguarde o resultado antes 
    d) Confirme: "Ótimo! [Produto] (R$XX) separado para voce retirar na visita. Pagamento na barbearia!"
    e) NUNCA invente produto_id — use sempre o id retornado por listar_produtos
 10. Apos confirmar agendamento, ofereca produtos se houver. Se cliente recusar, despeça-se gentilmente
-11. Use emojis moderadamente{regras_extras_str}
+11. RESPOSTA A LEMBRETE: Se o contexto indicar AGUARDANDO CONFIRMACAO, interprete a mensagem como resposta ao lembrete e chame responder_confirmacao(agendamento_id, confirmou). "sim", "vou", "estarei la", "confirmo" = confirmou=True. "nao vou", "nao consigo", "desmarcar", "cancelar" = confirmou=False. NAO chame cancelar_agendamento nesse caso
+12. Use emojis moderadamente{regras_extras_str}
 """
 
 def _artigo(tipo: str) -> str:
@@ -151,13 +186,16 @@ COMANDOS DISPONIVEIS:
 - "agenda" ou "agenda hoje" → chame agenda_hoje sem parametros
 - "agenda DD/MM" ou "agenda amanha" → chame agenda_hoje com a data convertida para YYYY-MM-DD
 - "pedidos" ou "pedidos pendentes" → chame listar_pedidos_pendentes com apenas_hoje=true
-- "relatorio" ou "relatorio da semana" → chame relatorio_barbeiro com data_inicio=7 dias atras e data_fim=hoje (formato YYYY-MM-DD)
+- "relatorio" (sozinho) → chame gerar_relatorio_mensal sem parametros (parcial do mes corrente)
+- "relatorio da semana" ou "relatorio [periodo]" → chame relatorio_barbeiro com data_inicio e data_fim no formato YYYY-MM-DD
 - "top clientes" → chame top_clientes com limite=5
 - "estoque" → chame listar_produtos com apenas_disponiveis=false
 - "add estoque [produto] [qtd]" → chame atualizar_estoque com modo="adicionar" e a quantidade informada
 - "estoque [produto] [qtd]" (com numero) → chame atualizar_estoque com modo="definir" e a quantidade informada
 - "sem estoque [produto]" → chame atualizar_estoque com modo="zerar" e quantidade=0
 - "recuperar clientes" ou "recuperar clientes [N] dias" → chame recuperar_clientes com dias=N (padrao 30)
+- "faltou {{hora}}" ou "faltou {{nome}}" → chame marcar_no_show com data_hora=hoje + hora (ex: "faltou 14:00") ou nome= (ex: "faltou João" → nome="João")
+- Resposta ao resumo diario ("Algum faltou?"): se barbeiro citar nome(s) → chame marcar_no_show(nome=...) para CADA nome mencionado, um por vez. Se responder "NENHUM", "nenhum", "todos vieram" ou similar → responda "Ok! Os demais serao marcados como concluido automaticamente." sem chamar ferramenta
 
 FORMATO DAS RESPOSTAS (compacto, sem texto desnecessario):
 - Use emojis como icones de secao: 📅 agenda, 📦 pedidos, 📊 relatorio, 👥 clientes, 🧴 estoque
@@ -181,7 +219,8 @@ TOOLS = [
     {"name":"relatorio_barbeiro","description":"Relatorio de agendamentos e receita do periodo.","parameters":{"type":"object","properties":{"data_inicio":{"type":"string"},"data_fim":{"type":"string"}},"required":["data_inicio","data_fim"]}},
     {"name":"historico_cliente","description":"Historico do cliente.","parameters":{"type":"object","properties":{"cliente_id":{"type":"string"},"limite":{"type":"integer"}},"required":["cliente_id"]}},
     {"name":"buscar_sessao","description":"Historico de conversa.","parameters":{"type":"object","properties":{"telefone":{"type":"string"},"limite":{"type":"integer"}},"required":["telefone"]}},
-    {"name":"salvar_mensagem_sessao","description":"Salva mensagem na sessao.","parameters":{"type":"object","properties":{"telefone":{"type":"string"},"mensagem":{"type":"string"},"papel":{"type":"string"}},"required":["telefone","mensagem","papel"]}}
+    {"name":"salvar_mensagem_sessao","description":"Salva mensagem na sessao.","parameters":{"type":"object","properties":{"telefone":{"type":"string"},"mensagem":{"type":"string"},"papel":{"type":"string"}},"required":["telefone","mensagem","papel"]}},
+    {"name":"responder_confirmacao","description":"Registra resposta do cliente ao lembrete de confirmacao de horario. Use SOMENTE quando contexto indicar AGUARDANDO CONFIRMACAO. confirmou=True se vai comparecer, False se cancelou.","parameters":{"type":"object","properties":{"agendamento_id":{"type":"string"},"confirmou":{"type":"boolean"}},"required":["agendamento_id","confirmou"]}}
 ]
 
 ADMIN_TOOLS = [
@@ -192,12 +231,210 @@ ADMIN_TOOLS = [
     {"type":"function","function":{"name":"listar_produtos","description":"Lista produtos com estoque.","parameters":{"type":"object","properties":{"categoria":{"type":"string"},"apenas_disponiveis":{"type":"boolean"}}}}},
     {"type":"function","function":{"name":"atualizar_estoque","description":"Atualiza estoque de um produto pelo nome.","parameters":{"type":"object","properties":{"nome_produto":{"type":"string"},"quantidade":{"type":"integer"},"modo":{"type":"string","enum":["adicionar","definir","zerar"]}},"required":["nome_produto","modo"]}}},
     {"type":"function","function":{"name":"recuperar_clientes","description":"Envia mensagem de recuperacao no WhatsApp para clientes inativos ha mais de N dias.","parameters":{"type":"object","properties":{"dias":{"type":"integer","description":"Dias de inatividade (padrao 30)"}}}}},
+    {"type":"function","function":{"name":"marcar_no_show","description":"Marca cliente como no-show (faltou sem avisar). Aceita agendamento_id, data_hora ou nome (busca no dia de hoje). Use nome= para processar respostas ao resumo diario.","parameters":{"type":"object","properties":{"agendamento_id":{"type":"string"},"data_hora":{"type":"string","description":"YYYY-MM-DD HH:MM"},"nome":{"type":"string","description":"Nome parcial do cliente — busca automaticamente no dia de hoje"}}}}},
+    {"type":"function","function":{"name":"gerar_relatorio_mensal","description":"Gera relatorio mensal de negocios com faturamento, clientes, no-show e horario ocioso. Sem parametros = mes corrente parcial.","parameters":{"type":"object","properties":{"ano":{"type":"integer"},"mes":{"type":"integer","description":"1-12"}}}}},
 ]
 
 LLM_TOOLS = [
     {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
     for t in TOOLS
 ]
+
+async def auto_concluido_job():
+    """Marca como concluido agendamentos passados que ainda estão como agendado.
+
+    Roda a cada hora. Garante que silêncio do barbeiro nunca vira no-show —
+    apenas appointments explicitamente marcados pelo barbeiro recebem no_show.
+    """
+    print("[SCHEDULER] auto_concluido: iniciando", flush=True)
+    try:
+        agora = datetime.now(SP_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.execute(
+            "UPDATE agendamentos SET status = 'concluido'"
+            " WHERE data_hora < ? AND status = 'agendado'",
+            (agora,),
+        )
+        conn.commit()
+        n = cur.rowcount
+        conn.close()
+        if n:
+            print(f"[SCHEDULER] auto_concluido: {n} agendamento(s) → concluido", flush=True)
+    except Exception as e:
+        print(f"[ERRO] auto_concluido_job: {e}", flush=True)
+
+
+async def enviar_lembretes_job():
+    """Envia lembrete de confirmação para clientes com agendamento próximo.
+
+    Roda a cada 30 min. Critérios para envio:
+    - status = 'agendado' e lembrete_enviado_em IS NULL
+    - agendamento dentro das próximas N horas (configurável)
+    - agendamento foi feito com pelo menos N horas de antecedência (evita lembrete pós-booking imediato)
+    """
+    antecedencia = int(_jobs_cfg.get("confirmacao_antecedencia_horas", 3))
+    print(f"[SCHEDULER] lembretes: buscando agendamentos em até {antecedencia}h", flush=True)
+    try:
+        agora = datetime.now(SP_TZ)
+        agora_str = agora.strftime("%Y-%m-%d %H:%M:%S")
+        limite_str = (agora + timedelta(hours=antecedencia)).strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT a.id, a.data_hora, a.servico, a.criado_em, c.telefone, c.nome
+            FROM agendamentos a
+            JOIN clientes c ON a.cliente_id = c.id
+            WHERE a.status = 'agendado'
+              AND a.lembrete_enviado_em IS NULL
+              AND a.data_hora > ?
+              AND a.data_hora <= ?
+            """,
+            (agora_str, limite_str),
+        ).fetchall()
+        conn.close()
+
+        enviados = 0
+        for row in rows:
+            # Pula se o agendamento foi feito com menos de N horas de antecedência
+            try:
+                criado = datetime.fromisoformat(row["criado_em"]).replace(tzinfo=None)
+                data_hora = datetime.strptime(row["data_hora"][:16], "%Y-%m-%d %H:%M")
+                if (data_hora - criado) < timedelta(hours=antecedencia):
+                    continue
+            except Exception:
+                pass
+
+            hora = row["data_hora"][11:16]
+            mensagem = (
+                f"Oi {row['nome']}! Lembrete: seu horário é hoje às *{hora}*. "
+                f"Confirma sua presença? Responda *SIM* ou *NÃO PODEREI IR* ✂️"
+            )
+            await send_whatsapp_message(row["telefone"], mensagem)
+
+            # Marca lembrete como enviado (idempotência)
+            conn2 = sqlite3.connect(str(DB_PATH))
+            conn2.execute(
+                "UPDATE agendamentos SET lembrete_enviado_em = ? WHERE id = ?",
+                (agora.isoformat(), row["id"]),
+            )
+            conn2.commit()
+            conn2.close()
+            enviados += 1
+
+        if enviados:
+            print(f"[SCHEDULER] lembretes: {enviados} lembrete(s) enviado(s)", flush=True)
+    except Exception as e:
+        print(f"[ERRO] enviar_lembretes_job: {e}", flush=True)
+
+
+async def resumo_dia_job():
+    """Envia ao barbeiro o resumo de atendimentos do dia para detecção de no-show.
+
+    Roda no horário de fechamento + 30 min (configurável em barbershops.yaml).
+    Idempotente: registra envio no audit_log, nunca envia duas vezes no mesmo dia.
+    Silêncio do barbeiro → auto_concluido_job marca os restantes como concluido.
+    """
+    print("[SCHEDULER] resumo_dia: iniciando", flush=True)
+    if not BARBEIRO_PHONE:
+        print("[SCHEDULER] resumo_dia: BARBEIRO_PHONE não configurado, pulando", flush=True)
+        return
+    try:
+        hoje = datetime.now(SP_TZ).strftime("%Y-%m-%d")
+
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+
+        # Idempotência: verifica se já enviou hoje
+        ja_enviado = conn.execute(
+            "SELECT id FROM audit_log WHERE entidade='job' AND acao='resumo_dia' AND entidade_id=?",
+            (hoje,),
+        ).fetchone()
+        if ja_enviado:
+            print("[SCHEDULER] resumo_dia: já enviado hoje, pulando", flush=True)
+            conn.close()
+            return
+
+        rows = conn.execute(
+            """
+            SELECT strftime('%H:%M', a.data_hora) AS hora, c.nome, a.status
+            FROM agendamentos a
+            JOIN clientes c ON a.cliente_id = c.id
+            WHERE DATE(a.data_hora) = ? AND a.status NOT IN ('cancelado')
+            ORDER BY a.data_hora
+            """,
+            (hoje,),
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            print("[SCHEDULER] resumo_dia: nenhum agendamento hoje, pulando", flush=True)
+            return
+
+        lista = ", ".join(f"{r['nome']} {r['hora']}" for r in rows)
+        mensagem = (
+            f"Fechamento de hoje ({hoje}):\n{lista}\n\n"
+            f"Algum faltou? Responda o(s) nome(s) ou *NENHUM* ✂️"
+        )
+        await send_whatsapp_message(BARBEIRO_PHONE, mensagem)
+
+        # Registra envio para idempotência
+        conn2 = sqlite3.connect(str(DB_PATH))
+        conn2.execute(
+            "INSERT INTO audit_log (id, entidade, entidade_id, acao, detalhes, criado_em) VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "job", hoje, "resumo_dia",
+             json.dumps({"total": len(rows)}, ensure_ascii=False),
+             datetime.now(SP_TZ).isoformat()),
+        )
+        conn2.commit()
+        conn2.close()
+        print(f"[SCHEDULER] resumo_dia: enviado ({len(rows)} agendamentos)", flush=True)
+    except Exception as e:
+        print(f"[ERRO] resumo_dia_job: {e}", flush=True)
+
+
+async def relatorio_mensal_job():
+    """Envia relatório do mês anterior ao barbeiro no 1º de cada mês às 9h."""
+    print("[SCHEDULER] relatorio_mensal: iniciando", flush=True)
+    if not BARBEIRO_PHONE:
+        print("[SCHEDULER] relatorio_mensal: BARBEIRO_PHONE não configurado, pulando", flush=True)
+        return
+    try:
+        agora = datetime.now(SP_TZ)
+        ano_ref = agora.year if agora.month > 1 else agora.year - 1
+        mes_ref = agora.month - 1 if agora.month > 1 else 12
+        chave = f"{ano_ref:04d}-{mes_ref:02d}"
+
+        conn = sqlite3.connect(str(DB_PATH))
+        ja_enviado = conn.execute(
+            "SELECT id FROM audit_log WHERE entidade='job' AND acao='relatorio_mensal' AND entidade_id=?",
+            (chave,),
+        ).fetchone()
+        conn.close()
+        if ja_enviado:
+            print(f"[SCHEDULER] relatorio_mensal: já enviado para {chave}, pulando", flush=True)
+            return
+
+        raw = await call_mcp_tool("gerar_relatorio_mensal", {"ano": ano_ref, "mes": mes_ref})
+        data = json.loads(raw)
+        texto = data.get("relatorio", "")
+        if texto:
+            await send_whatsapp_message(BARBEIRO_PHONE, texto)
+
+        conn2 = sqlite3.connect(str(DB_PATH))
+        conn2.execute(
+            "INSERT INTO audit_log (id, entidade, entidade_id, acao, detalhes, criado_em) VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "job", chave, "relatorio_mensal",
+             json.dumps({"ano": ano_ref, "mes": mes_ref}),
+             datetime.now(SP_TZ).isoformat()),
+        )
+        conn2.commit()
+        conn2.close()
+        print(f"[SCHEDULER] relatorio_mensal: enviado para {chave}", flush=True)
+    except Exception as e:
+        print(f"[ERRO] relatorio_mensal_job: {e}", flush=True)
+
 
 async def enviar_recuperacao_clientes(dias: int = None):
     if dias is None:
@@ -242,12 +479,45 @@ async def lifespan(app_: FastAPI):
     scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
     scheduler.add_job(
         enviar_recuperacao_clientes,
-        CronTrigger(hour=HORARIO_RECUPERACAO, minute=0),
+        CronTrigger(hour=HORARIO_RECUPERACAO, minute=0, timezone="America/Sao_Paulo"),
         id="recuperacao_clientes",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        auto_concluido_job,
+        CronTrigger(minute=5, timezone="America/Sao_Paulo"),  # toda hora aos :05
+        id="auto_concluido",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        enviar_lembretes_job,
+        CronTrigger(minute="0,30", timezone="America/Sao_Paulo"),  # a cada 30 min
+        id="lembretes_confirmacao",
+        replace_existing=True,
+    )
+    _horario_resumo = _jobs_cfg.get("horario_resumo_dia", "19:30")
+    try:
+        _h_resumo, _m_resumo = map(int, _horario_resumo.split(":"))
+    except Exception:
+        _h_resumo, _m_resumo = 19, 30
+    scheduler.add_job(
+        resumo_dia_job,
+        CronTrigger(hour=_h_resumo, minute=_m_resumo, timezone="America/Sao_Paulo"),
+        id="resumo_dia",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        relatorio_mensal_job,
+        CronTrigger(day=1, hour=9, minute=0, timezone="America/Sao_Paulo"),
+        id="relatorio_mensal",
         replace_existing=True,
     )
     scheduler.start()
     print(f"[SCHEDULER] Agendado: recuperacao diaria as {HORARIO_RECUPERACAO}:00 SP", flush=True)
+    print("[SCHEDULER] Agendado: auto_concluido a cada hora (:05)", flush=True)
+    print("[SCHEDULER] Agendado: lembretes_confirmacao a cada 30 min (:00/:30)", flush=True)
+    print(f"[SCHEDULER] Agendado: resumo_dia as {_horario_resumo} SP", flush=True)
+    print("[SCHEDULER] Agendado: relatorio_mensal no dia 1 de cada mes as 09:00 SP", flush=True)
     yield
     scheduler.shutdown()
 
@@ -282,10 +552,10 @@ async def call_mcp_tool(tool_name: str, arguments: dict) -> str:
         async with httpx.AsyncClient(timeout=30.0) as http:
             async with http.stream("POST", MCP_SERVER_URL, json=payload, headers=headers) as r:
                 print(f"[DEBUG] MCP {tool_name} status={r.status_code}", flush=True)
-                if r.status_code == 400:
+                if r.status_code in (400, 404):
                     _mcp_session_id = None
                     body = await r.aread()
-                    return json.dumps({"erro": f"MCP 400: {body[:200]}"})
+                    return json.dumps({"erro": f"MCP {r.status_code}: {body[:200]}"})
                 ct = r.headers.get("content-type", "")
                 if "text/event-stream" in ct:
                     async for line in r.aiter_lines():
@@ -361,13 +631,21 @@ async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
                     hist_raw = await call_mcp_tool("historico_cliente", {"cliente_id": c.get("id"), "limite": 5})
                     hist_data = json.loads(hist_raw)
                     agendamentos = hist_data.get("agendamentos", [])
-                    futuros = [a for a in agendamentos if a.get("status") == "confirmado"]
+                    futuros = [a for a in agendamentos if a.get("status") in ("agendado", "confirmado")]
                     if futuros:
                         ags_str = "; ".join(
-                            f"id={a['id']} data={a['data_hora']} servico={a['servico']}"
+                            f"id={a['id']} data={a['data_hora']} servico={a['servico']} status={a['status']}"
                             for a in futuros
                         )
-                        contexto_cliente += f". Agendamentos confirmados: [{ags_str}]"
+                        contexto_cliente += f". Agendamentos ativos: [{ags_str}]"
+                    # Detecta se há agendamento aguardando confirmação de lembrete
+                    aguardando_conf = [a for a in agendamentos if a.get("status") == "agendado" and a.get("lembrete_enviado_em")]
+                    if aguardando_conf:
+                        pc = aguardando_conf[0]
+                        contexto_cliente += (
+                            f". AGUARDANDO CONFIRMACAO: id={pc['id']} em {pc['data_hora']} ({pc['servico']})"
+                            " — lembrete enviado, cliente pode estar respondendo agora"
+                        )
                 except Exception as e:
                     print(f"[WARN] Pre-fetch historico_cliente falhou: {e}", flush=True)
             print(f"[DEBUG] {contexto_cliente}", flush=True)
@@ -434,6 +712,26 @@ async def processar_mensagem(telefone: str, texto: str, send_to: str = None):
                         "status": "iniciado",
                         "mensagem": f"Recuperacao de clientes inativos ha mais de {dias_rec} dias iniciada em segundo plano."
                     }, ensure_ascii=False)
+                elif tc.function.name == "responder_confirmacao":
+                    resultado = await call_mcp_tool(tc.function.name, args)
+                    # Notifica o barbeiro quando um slot vaga por recusa do cliente
+                    try:
+                        data = json.loads(resultado)
+                        if data.get("notificar_barbeiro") and BARBEIRO_PHONE:
+                            slot = data.get("data_hora", "")[:16]
+                            servico = data.get("servico", "")
+                            await send_whatsapp_message(
+                                BARBEIRO_PHONE,
+                                f"⚠️ Horário {slot} ({servico}) vagou — cliente confirmou que não vai. Slot disponível!",
+                            )
+                    except Exception:
+                        pass
+                elif tc.function.name == "marcar_no_show":
+                    # Se barbeiro passou só a hora (ex: "faltou 14:00"), monta data completa
+                    if "data_hora" in args and len(args["data_hora"]) <= 5:
+                        from datetime import date
+                        args["data_hora"] = f"{date.today().strftime('%Y-%m-%d')} {args['data_hora']}"
+                    resultado = await call_mcp_tool(tc.function.name, args)
                 else:
                     resultado = await call_mcp_tool(tc.function.name, args)
                 print(f"[DEBUG] Tool result: {resultado[:100]}", flush=True)
@@ -526,4 +824,204 @@ async def health():
 @app.post("/test-message")
 async def test_message(telefone: str, texto: str, background_tasks: BackgroundTasks):
     background_tasks.add_task(processar_mensagem, telefone, texto)
+    return {"ok": True}
+
+
+# ─── Página de Setup (/setup) ─────────────────────────────────────────────────
+
+_SETUP_HTML = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Conectar WhatsApp ✂️</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#fff;border-radius:20px;padding:36px 32px;max-width:420px;width:100%;text-align:center;box-shadow:0 2px 24px rgba(0,0,0,.10)}
+.logo{font-size:40px;margin-bottom:8px}
+h1{font-size:20px;font-weight:700;color:#111;margin-bottom:4px}
+.subtitle{font-size:13px;color:#888;margin-bottom:22px}
+.status{display:inline-flex;align-items:center;gap:7px;padding:5px 16px;border-radius:20px;font-size:13px;font-weight:600;margin-bottom:22px;transition:all .3s}
+.status .dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.s-wait{background:#fff8e1;color:#f59f00}
+.s-conn{background:#e8f4fd;color:#1c7ed6}
+.s-ok  {background:#ebfbee;color:#2f9e44}
+.s-err {background:#fff5f5;color:#e03131}
+#qr-wrap{display:inline-block;border:2px solid #eee;border-radius:14px;padding:14px;margin-bottom:14px;background:#fff}
+#qrcode canvas,#qrcode img{display:block}
+.spinner{width:48px;height:48px;border:4px solid #e9ecef;border-top-color:#25d366;border-radius:50%;animation:spin .75s linear infinite;margin:18px auto}
+@keyframes spin{to{transform:rotate(360deg)}}
+.timer{font-size:12px;color:#aaa;margin-bottom:16px}
+.timer b{color:#555}
+.steps{background:#f8f9fa;border-radius:10px;padding:14px 16px;text-align:left;font-size:13px;color:#555;line-height:1.9;margin-bottom:18px}
+.steps ol{padding-left:18px}
+.steps li strong{color:#222}
+#connected-section{display:none}
+.ok-icon{font-size:52px;margin-bottom:10px}
+.ok-title{font-size:18px;font-weight:700;color:#2f9e44;margin-bottom:6px}
+.ok-sub{font-size:13px;color:#777;margin-bottom:24px}
+.btn{border:none;border-radius:10px;padding:10px 22px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .2s,transform .1s}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.45;cursor:default}
+.btn:hover:not(:disabled){opacity:.85}
+.btn-ghost{background:#f1f3f5;color:#444}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">✂️</div>
+  <h1>Conectar WhatsApp</h1>
+  <p class="subtitle">Vincule o celular da barbearia ao bot</p>
+
+  <div id="status-badge" class="status s-wait">
+    <div class="dot"></div>
+    <span id="status-text">Carregando...</span>
+  </div>
+
+  <div id="qr-section">
+    <div id="spinner" class="spinner"></div>
+    <div id="qr-wrap" style="display:none">
+      <div id="qrcode"></div>
+    </div>
+    <div class="timer" id="timer-row" style="display:none">
+      QR expira em <b id="countdown">14</b>s
+    </div>
+    <div class="steps">
+      <ol>
+        <li>Abra o <strong>WhatsApp</strong> no celular</li>
+        <li>Toque em <strong>⋮ &rarr; Dispositivos vinculados</strong></li>
+        <li>Toque em <strong>&ldquo;Vincular dispositivo&rdquo;</strong></li>
+        <li>Aponte a câmera para o QR code acima</li>
+      </ol>
+    </div>
+    <button class="btn btn-ghost" id="btn-refresh" onclick="fetchQR()" disabled>
+      🔄 Gerar novo QR
+    </button>
+  </div>
+
+  <div id="connected-section">
+    <div class="ok-icon">✅</div>
+    <div class="ok-title">WhatsApp conectado!</div>
+    <div class="ok-sub">O bot está ativo e pronto para receber mensagens.</div>
+    <button class="btn btn-ghost" onclick="reconnect()">🔄 Conectar outro número</button>
+  </div>
+</div>
+
+<script>
+let timerInt=null, pollInt=null, secs=14, connected=false;
+
+function setStatus(state){
+  const b=document.getElementById('status-badge'), t=document.getElementById('status-text');
+  const cls={open:'s-ok',connecting:'s-conn',error:'s-err'};
+  b.className='status '+(cls[state]||'s-wait');
+  t.textContent={open:'Conectado',connecting:'Conectando...',error:'Erro — verifique os containers',close:'Aguardando leitura'}[state]||'Aguardando leitura';
+}
+
+async function pollStatus(){
+  try{
+    const d=await(await fetch('/setup/status')).json();
+    setStatus(d.state);
+    if(d.state==='open'&&!connected){
+      connected=true; clearInterval(timerInt);
+      document.getElementById('qr-section').style.display='none';
+      document.getElementById('connected-section').style.display='block';
+    } else if(d.state!=='open'&&connected){
+      connected=false;
+      document.getElementById('connected-section').style.display='none';
+      document.getElementById('qr-section').style.display='block';
+      fetchQR();
+    }
+  }catch(e){setStatus('error');}
+}
+
+async function fetchQR(){
+  clearInterval(timerInt);
+  const sp=document.getElementById('spinner'), wrap=document.getElementById('qr-wrap');
+  const tr=document.getElementById('timer-row'), btn=document.getElementById('btn-refresh');
+  sp.style.display='block'; wrap.style.display='none'; tr.style.display='none'; btn.disabled=true;
+  try{
+    const d=await(await fetch('/setup/qr')).json();
+    if(d.code){
+      document.getElementById('qrcode').innerHTML='';
+      new QRCode(document.getElementById('qrcode'),{text:d.code,width:256,height:256,colorDark:'#000',colorLight:'#fff',correctLevel:QRCode.CorrectLevel.L});
+      sp.style.display='none'; wrap.style.display='inline-block'; tr.style.display='block'; btn.disabled=false;
+      startTimer();
+    }
+  }catch(e){setStatus('error'); sp.style.display='none'; btn.disabled=false;}
+}
+
+function startTimer(){
+  secs=14; document.getElementById('countdown').textContent=secs;
+  timerInt=setInterval(()=>{
+    secs--; document.getElementById('countdown').textContent=secs;
+    if(secs<=0){clearInterval(timerInt); fetchQR();}
+  },1000);
+}
+
+async function reconnect(){
+  connected=false; setStatus('connecting');
+  document.getElementById('connected-section').style.display='none';
+  document.getElementById('qr-section').style.display='block';
+  try{await fetch('/setup/reconnect',{method:'POST'});}catch(e){}
+  fetchQR();
+}
+
+async function init(){
+  await pollStatus();
+  if(!connected) fetchQR();
+  pollInt=setInterval(pollStatus,4000);
+}
+
+init();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/setup", response_class=HTMLResponse, include_in_schema=False)
+async def setup_page():
+    return _SETUP_HTML
+
+
+@app.get("/setup/status", include_in_schema=False)
+async def setup_status():
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            r = await http.get(
+                f"{EVOLUTION_API_URL}/instance/connectionState/{EVOLUTION_INSTANCE}",
+                headers={"apikey": EVOLUTION_API_KEY},
+            )
+            data = r.json()
+            state = data.get("instance", {}).get("state", "close")
+            return {"state": state}
+    except Exception as e:
+        return {"state": "error", "detail": str(e)}
+
+
+@app.get("/setup/qr", include_in_schema=False)
+async def setup_qr():
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.get(
+                f"{EVOLUTION_API_URL}/instance/connect/{EVOLUTION_INSTANCE}",
+                headers={"apikey": EVOLUTION_API_KEY},
+            )
+            data = r.json()
+            return {"code": data.get("code", "")}
+    except Exception as e:
+        return {"code": "", "error": str(e)}
+
+
+@app.post("/setup/reconnect", include_in_schema=False)
+async def setup_reconnect():
+    async with httpx.AsyncClient(timeout=10.0) as http:
+        try:
+            await http.delete(
+                f"{EVOLUTION_API_URL}/instance/logout/{EVOLUTION_INSTANCE}",
+                headers={"apikey": EVOLUTION_API_KEY},
+            )
+        except Exception:
+            pass
     return {"ok": True}
